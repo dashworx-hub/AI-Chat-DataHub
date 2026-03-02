@@ -1,7 +1,11 @@
 // API utility functions - preserving exact API connections
 
 export const getApiBase = () => {
-  return localStorage.getItem('apiBase') || 'http://localhost:8080';
+  return (
+    localStorage.getItem('apiBase') ||
+    import.meta.env.VITE_API_BASE_URL ||
+    'http://localhost:8080'
+  );
 };
 
 export const setApiBase = (base) => {
@@ -167,7 +171,7 @@ export const sendChatMessageStream = async (
   agentPath = null,
   { onCotStep, onDone, onError }
 ) => {
-  const base = localStorage.getItem('apiBase') || 'http://localhost:8080';
+  const base = getApiBase();
   const url = `${base}/api/chat/stream`;
   const body = {
     message,
