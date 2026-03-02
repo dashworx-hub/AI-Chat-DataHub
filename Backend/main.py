@@ -1,9 +1,10 @@
 import asyncio
+import base64
+import json
 import os
 import re
-import json
-import time
 import secrets
+import time
 import logging
 import threading
 from datetime import date
@@ -322,7 +323,10 @@ _TOKEN_REFRESH_BUFFER = 300  # seconds before expiry to refresh
 
 
 def get_access_token() -> str:
-    """Mint a bearer token via service account JSON. Caches token until ~5 min before expiry."""
+    """Mint a bearer token via service account JSON. Caches token until ~5 min before expiry.
+    Supports (in order): GOOGLE_CREDENTIALS_JSON_B64, GOOGLE_CREDENTIALS_JSON, GOOGLE_APPLICATION_CREDENTIALS.
+    Use B64 on Railway to avoid JSON escaping issues.
+    """
     global _token_cache
     now = time.time()
     with _token_lock:
@@ -330,23 +334,37 @@ def get_access_token() -> str:
             token, expires_at = _token_cache
             if now < expires_at - _TOKEN_REFRESH_BUFFER:
                 return token
-        # Refresh
-        key_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
-        if not key_path:
-            raise HTTPException(
-                500,
-                "GOOGLE_APPLICATION_CREDENTIALS is not set. Set it in .env (repo root or backend/) to the path of your GCP service account JSON key."
-            )
-        if not os.path.isfile(key_path):
-            raise HTTPException(
-                500,
-                f"GOOGLE_APPLICATION_CREDENTIALS file not found: {key_path}. "
-                "Use an absolute path, or put the key in backend/ or repo root and use a path relative to repo root (e.g. service-account.json)."
-            )
-        creds = service_account.Credentials.from_service_account_file(key_path, scopes=SCOPES)
+        # 1) Base64-encoded JSON (Railway - no escaping issues)
+        b64 = os.environ.get("GOOGLE_CREDENTIALS_JSON_B64", "").strip()
+        if b64:
+            try:
+                raw = base64.b64decode(b64).decode("utf-8")
+                info = json.loads(raw)
+                creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+            except Exception as e:
+                raise HTTPException(500, f"GOOGLE_CREDENTIALS_JSON_B64 invalid: {e}")
+        else:
+            # 2) Raw JSON string
+            creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
+            if creds_json:
+                try:
+                    info = json.loads(creds_json)
+                    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+                except json.JSONDecodeError as e:
+                    raise HTTPException(500, f"GOOGLE_CREDENTIALS_JSON invalid JSON: {e}")
+            else:
+                # 3) File path (local dev)
+                key_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+                if not key_path:
+                    raise HTTPException(
+                        500,
+                        "Set GOOGLE_CREDENTIALS_JSON_B64 (Railway) or GOOGLE_APPLICATION_CREDENTIALS (local file path)."
+                    )
+                if not os.path.isfile(key_path):
+                    raise HTTPException(500, f"GOOGLE_APPLICATION_CREDENTIALS file not found: {key_path}")
+                creds = service_account.Credentials.from_service_account_file(key_path, scopes=SCOPES)
         creds.refresh(GARequest())
         token = creds.token
-        # GCP tokens typically expire in 3600s; use 3500 to be safe
         expires_at = now + 3500
         _token_cache = (token, expires_at)
         return token
