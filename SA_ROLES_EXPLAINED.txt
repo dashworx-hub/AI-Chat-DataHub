@@ -1,0 +1,161 @@
+
+SERVICE ACCOUNT ROLES - WHAT THEY DO AND WHERE THEY ARE USED
+
+This file explains each role assigned to the service account (SA) and how the
+application uses it. Written in plain language.
+
+
+BIGQUERY ROLES
+
+
+1. BQ Data Viewer
+   - What it does: Lets the SA read data from BigQuery tables.
+   - Where it's used: When a user chats with an agent, the agent runs SQL
+     queries against BigQuery. The SA needs to read the table data to return
+     answers. Without this role, chat would fail when querying data.
+   - In the app: The "Chat" page - every time you ask a question and the
+     agent runs a query on our BigQuery data.
+
+--------------------------------------------------------------------------------
+
+2. BQ Job User
+   - What it does: Lets the SA run (execute) BigQuery jobs/queries.
+   - Where it's used: Running a query is a "job" in BigQuery. The SA must
+     be allowed to create and run these jobs. Without this role, the agent
+     could not execute any SQL.
+   - In the app: The "Chat" page - when the agent runs SQL to answer our
+     question.
+
+--------------------------------------------------------------------------------
+
+3. BQ Metadata Viewer
+   - What it does: Lets the SA see the list of projects, datasets, tables,
+     and table schemas (column names and types). It does NOT allow reading
+     the actual data in the tables.
+   - Where it's used:
+     * Create Agent page: When you pick a GCP project, the app lists
+       datasets. When you pick a dataset, it lists tables. When you pick
+       a table, it shows the schema (columns). All of this uses metadata
+       only.
+     * API endpoints: /api/bq/projects, /api/bq/datasets, /api/bq/tables,
+       /api/bq/table-schema.
+   - In the app: Create Agent > Data Sources section (Organization ID,
+     project, dataset, table dropdowns and "Show schema").
+
+
+GEMINI DATA ANALYTICS (DATA AGENT) ROLES
+
+
+4. Gemini Data analytics data agent creator
+   - What it does: Lets the SA create new Data Analytics Agents in Google
+     Cloud.
+   - Where it's used: When you fill out the Create Agent form and click
+     Create, the app calls the Gemini Data Analytics API to create a new
+     agent with our instructions and data source (BigQuery project/dataset/
+     table).
+   - In the app: Create Agent page > Create button.
+
+--------------------------------------------------------------------------------
+
+5. Gemini Data analytics data agent editor
+   - What it does: Lets the SA update existing agents (e.g. change the
+     system instruction).
+   - Where it's used: When you edit an agent's instruction in the Agent
+     Manager and save, the app sends a PATCH request to update that agent.
+   - In the app: Agent Manager > Edit instruction > Save.
+
+--------------------------------------------------------------------------------
+
+6. Gemini Data analytics data agent owner
+   - What it does: Lets the SA delete Data Analytics Agents. Owner includes
+     delete permission.
+   - Where it's used: When you delete an agent from the Agent Manager, the
+     app calls the API to delete that agent from Google Cloud.
+   - In the app: Agent Manager > Delete agent.
+
+--------------------------------------------------------------------------------
+
+7. Gemini Data analytics data agent user
+   - What it does: Lets the SA use (invoke) agents for chat. The SA can
+     send messages to an agent and get responses.
+   - Where it's used: When you select a data source and send a message on
+     the Chat page, the app calls the chat API with the selected agent.
+     The agent then runs BigQuery (using BQ roles above) and returns the
+     answer.
+   - In the app: Chat page > sending any message to an agent.
+
+--------------------------------------------------------------------------------
+
+8. Gemini for google cloud user
+   - What it does: Base access to the Gemini Data Analytics API in Google
+     Cloud. Other Gemini roles (creator, editor, owner, user) build on top
+     of this.
+   - Where it's used: All Gemini Data Analytics API calls (list agents,
+     create, update, delete, chat) run in the context of this API. Without
+     it, those calls would be rejected.
+   - In the app: Every feature that talks to Gemini Data Analytics (sources
+     list, agent list, create, edit, delete, chat).
+
+
+OTHER ROLE
+
+
+9. Service account consumer
+   - What it does: Lets the SA "consume" (use) Google Cloud APIs and have
+     the usage billed to our billing project. When the app sends
+     x-goog-user-project, that project is charged for the API calls.
+   - Where it's used: Every API call from the backend (BigQuery, Gemini
+     Data Analytics) specifies the billing project. Without this role, APIs
+     would refuse the request or you could not use them under that project.
+   - In the app: All backend API usage; required for the app to work at all.
+
+
+ORGANIZATION-LEVEL ROLE (IF YOU USE ORG PROJECT LISTING)
+
+
+10. Browser (roles/browser) - at organization level, not in our list
+    - What it does: Lets the SA list projects under a GCP organization.
+    - Where it's used: Create Agent > Organization ID (Optional) > Load
+      Projects. The app calls the Cloud Resource Manager API to list
+      projects under the given org ID.
+    - In the app: Create Agent > Data Sources > "Organization ID (Optional)"
+      and "Load Projects".
+
+
+ACCESSING A CLIENT'S DATA (CLIENT'S GCP PROJECT)
+
+
+11. BigQuery Data Viewer in the client's project
+    - What it does: Lets the SA read data from BigQuery tables in the client's
+      GCP project. The client adds our SA as a principal in their project
+      (IAM) and grants the role "BigQuery Data Viewer". Without this, the SA
+      cannot query the client's datasets or tables.
+    - Where it's used: When an agent is configured with a data source in the
+      client's project (project/dataset/table), chat and metadata listing
+      need the SA to have access in that project. BQ Data Viewer allows
+      listing datasets and tables (with BQ Metadata Viewer on our side) and
+      reading table data when running queries.
+    - In the app: Create Agent (picking project/dataset/table in the client's
+      project), Chat (when the selected agent uses that client's data).
+    - Setup: In the client's GCP project, add our SA as a principal and
+      grant the role "BigQuery Data Viewer" (roles/bigquery.dataViewer).
+
+
+QUICK REFERENCE TABLE
+
+
+Role                              | Used for
+----------------------------------|------------------------------------------
+BQ Data Viewer                    | Reading table data when agent runs queries
+BQ Job User                       | Running BigQuery queries (jobs)
+BQ Metadata Viewer                | Listing projects/datasets/tables, table schema
+Data agent creator                | Creating new agents (Create Agent page)
+Data agent editor                 | Updating agent instructions (Agent Manager)
+Data agent owner                  | Deleting agents (Agent Manager)
+Data agent user                   | Chat with agents (Chat page)
+Gemini for google cloud user      | Base access to Gemini Data Analytics API
+Service account consumer          | Billing API usage to our project
+
+
+End of file.
+

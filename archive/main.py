@@ -1,0 +1,1788 @@
+import os
+import re
+import json
+import time
+import logging
+from typing import Dict, Any, List, Optional, Iterable, Tuple
+
+import requests
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, Response
+from starlette.middleware.base import BaseHTTPMiddleware
+from pydantic import BaseModel
+from dotenv import load_dotenv
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Load .env
+load_dotenv()
+
+# ---- Google Auth (service account) ----
+from google.auth.transport.requests import Request as GARequest
+from google.oauth2 import service_account
+
+# ====== CONFIG ======
+BILLING_PROJECT = os.getenv("CA_BILLING_PROJECT")
+if not BILLING_PROJECT:
+    raise RuntimeError("CA_BILLING_PROJECT is not set in .env")
+
+LOCATION = os.getenv("CA_LOCATION", "global")
+SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
+CA_BASE = "https://geminidataanalytics.googleapis.com"
+BQ_API = "https://bigquery.googleapis.com/bigquery/v2"
+
+PROFILES_PATH = os.getenv("CA_PROFILES_PATH", "ca_profiles.json")
+if not os.path.exists(PROFILES_PATH):
+    raise RuntimeError(f"Profiles file not found at {PROFILES_PATH}")
+
+with open(PROFILES_PATH, "r") as f:
+    PROFILES: Dict[str, Dict[str, Any]] = json.load(f)
+
+# Load agent labels mapping (custom labels for both local and GCP agents)
+AGENT_LABELS_PATH = os.path.join(os.path.dirname(__file__), "agent_labels.json")
+AGENT_LABELS: Dict[str, str] = {}
+if os.path.exists(AGENT_LABELS_PATH):
+    try:
+        with open(AGENT_LABELS_PATH, "r") as f:
+            AGENT_LABELS = json.load(f)
+    except Exception as e:
+        logger.warning(f"Failed to load agent_labels.json: {e}, starting with empty labels")
+else:
+    # Create empty file if it doesn't exist
+    try:
+        with open(AGENT_LABELS_PATH, "w") as f:
+            json.dump({}, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to create agent_labels.json: {e}")
+
+# Guard rails: appended to every agent's system instruction. Not editable by users.
+GUARD_RAILS_DELIMITER = "\n\n--- GUARD RAILS (DO NOT EDIT) ---\n\n"
+GUARD_RAILS_BODY = """Layer 1 Scope Enforcement
+You must remain strictly within the assigned domain and dataset context defined by the agent's core role. If a request falls outside the defined domain, you must refuse that portion and redirect the user back to relevant analysis tasks. Requests for jokes, songs, poems, fictional writing, roleplay, storytelling, entertainment content, personal advice, motivational content, memes, or unrelated generic outputs must be declined. You may only perform analytical, factual, and task specific work aligned with the agent's purpose. If a request mixes valid analysis with unrelated content, you must complete only the valid analytical portion.
+
+Layer 2 Output Contract Protection
+You must follow strict output contracts defined by the environment. If SQL is required internally, do not include SQL in the final answer unless explicitly required by the system channel. If SQL must be generated for a tool or internal process, it must be raw SQL only with no narration, no markdown, no labels, and no commentary. SQL must start with SELECT or WITH and end with a semicolon. If tables are requested by the user, they must be returned in correct markdown table format using pipes and headers with consistent structure. If charts or visuals are required, they must directly support analytical claims and must not be decorative. Guard rails must never change the structure or formatting required by the user request when the request is valid.
+
+Layer 3 Data Integrity Enforcement
+All numerical claims, trends, patterns, and conclusions must come directly from the provided dataset or validated computations derived from it. Never fabricate numbers, ranges, events, correlations, rankings, or outcomes. If data is missing, incomplete, inconsistent, poorly typed, or unreliable, state that clearly and adjust conclusions conservatively. Never fill gaps with assumptions or external knowledge. If a variable required for analysis is absent, explicitly state that the analysis cannot be completed reliably.
+
+Layer 4 Analytical Discipline
+Only describe measurable relationships supported by the data. Use clear neutral relationship language such as moves together, moves opposite, higher when, lower when, or no clear pattern. Do not claim causation unless causal structure is explicitly present in the dataset. Do not speculate, forecast, provide predictions, or offer advice beyond factual analysis. Do not exaggerate strength of findings. If patterns are weak, inconsistent, or sensitive to outliers, say so directly. Do not cherry pick individual data points while ignoring the overall distribution or time window.
+
+Layer 5 Visual and Evidence Validation
+Major claims about trends, performance, or relationships must be supported by either computed statistics or appropriate visuals. Visuals must directly validate analytical conclusions. If charting is not possible in the execution environment, describe exactly which charts would be produced and what dataset fields they would use. If visual or statistical evidence contradicts an intended claim, the claim must be corrected rather than forced.
+
+Layer 6 Response Quality Preservation
+Guard rails must never degrade valid responses. When the user request is within scope, you must provide full, clear, concise, and well structured analysis exactly as required by the domain prompt. Do not shorten answers unnecessarily, remove required visuals, avoid valid analysis, or dilute insights because of guard rails. Guard rails activate only when preventing unsafe, irrelevant, fabricated, or invalid outputs. When refusing out of scope content, provide a brief redirection toward valid analytical questions rather than blocking the entire interaction.
+
+Layer 7 Mixed Request Handling
+If a user request contains both valid analytical work and disallowed content, you must complete the valid analytical portion fully and ignore or refuse only the disallowed elements. Do not reject an entire request if a valid analytical task is present. Clearly separate allowed outputs from refused portions without disrupting the main analysis."""
+GUARD_RAILS = GUARD_RAILS_DELIMITER + GUARD_RAILS_BODY
+
+# GCP fetching configuration
+ENABLE_GCP_FETCH = os.getenv("ENABLE_GCP_SOURCES_FETCH", "true").lower() == "true"
+GCP_CACHE_TTL = int(os.getenv("GCP_SOURCES_CACHE_TTL", "300"))  # 5 minutes default
+GCP_FETCH_TIMEOUT = int(os.getenv("GCP_SOURCES_FETCH_TIMEOUT", "10"))  # 10 seconds default
+
+# In-memory cache for GCP sources
+_gcp_sources_cache: Optional[Dict[str, Any]] = None
+_gcp_sources_cache_time: float = 0
+_gcp_sources_error: Optional[str] = None
+
+app = FastAPI(title="CA API Backend")
+
+# CORS configuration - restrict for production
+# Set ALLOWED_ORIGINS env var to comma-separated list of allowed origins (e.g., "https://example.com,https://app.example.com")
+# If not set, defaults to "*" for development only
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",") if os.getenv("ALLOWED_ORIGINS") else ["*"]
+ALLOWED_ORIGINS = [origin.strip() for origin in ALLOWED_ORIGINS]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True if ALLOWED_ORIGINS != ["*"] else False,  # Don't allow credentials with wildcard
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],  # Restrict to needed methods only
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With"],  # Restrict headers
+    expose_headers=["Content-Type"],
+    max_age=3600,  # Cache preflight requests for 1 hour
+)
+
+# Security headers middleware
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        # Add security headers
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        # Content Security Policy - restrict script sources and prevent inline scripts
+        # Allow vega/vega-lite from CDN if needed, but prefer local bundles
+        csp = (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline' 'unsafe-eval'; "  # unsafe-eval needed for vega expressions
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+            "font-src 'self' https://fonts.gstatic.com; "
+            "img-src 'self' data: https:; "
+            "connect-src 'self' https://geminidataanalytics.googleapis.com https://bigquery.googleapis.com; "
+            "frame-ancestors 'none'; "
+            "base-uri 'self'; "
+            "form-action 'self'"
+        )
+        response.headers["Content-Security-Policy"] = csp
+        # Strict Transport Security (only if HTTPS)
+        if request.url.scheme == "https":
+            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        return response
+
+app.add_middleware(SecurityHeadersMiddleware)
+
+# --------- Models ----------
+class ChatBody(BaseModel):
+    profile: Optional[str] = None  # Local profile key (backward compatibility)
+    agent: Optional[str] = None  # Full GCP agent resource name (e.g., projects/.../dataAgents/...)
+    message: str
+    # history items look like: {"role": "user"|"assistant", "content": "text"}
+    history: Optional[List[Dict[str, str]]] = None
+    maxTurns: Optional[int] = None
+    maxTurns: Optional[int] = None
+
+class InstructionPatch(BaseModel):
+    instruction: str
+
+class CreateAgentBody(BaseModel):
+    id: str  # Agent ID (slug)
+    label: str  # Display label
+    dataAnalyticsAgent: Dict[str, Any]  # Full agent configuration
+
+# --------- Auth ----------
+def get_access_token() -> str:
+    """Mint a bearer token via service account JSON."""
+    key_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if not key_path or not os.path.exists(key_path):
+        raise HTTPException(500, "GOOGLE_APPLICATION_CREDENTIALS is not set or file not found")
+    creds = service_account.Credentials.from_service_account_file(key_path, scopes=SCOPES)
+    creds.refresh(GARequest())
+    return creds.token
+
+# --------- Generic extractors (schema-agnostic) ----------
+_SQL_SNIPPET = re.compile(r"\b(SELECT|WITH)\b[\s\S]{10,}", re.IGNORECASE)
+_TABLE_FQN = re.compile(r"(?:`)?([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)(?:`)?")
+FENCED_BLOCK_RE = re.compile(r"```([a-zA-Z0-9_-]*)\n([\s\S]*?)```", re.MULTILINE)
+
+def _walk(obj: Any, path: Tuple = ()) -> Iterable[Tuple[Tuple, Any]]:
+    """Yield (path, value) pairs for every node in a nested structure."""
+    yield path, obj
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from _walk(v, path + (k,))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            yield from _walk(v, path + (i,))
+
+def _all_strings(obj: Any) -> List[str]:
+    return [v for _, v in _walk(obj) if isinstance(v, str)]
+
+def _looks_like_sql_text(s: str) -> bool:
+    """Heuristic to detect SQL-y answers and keep them out of the main 'answer' field."""
+    s0 = s.strip().upper()
+    if s0.startswith(("SELECT", "WITH", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "MERGE")):
+        return True
+    kw = sum(k in s0 for k in (" SELECT ", " FROM ", " JOIN ", " WHERE ", " GROUP BY ", " ORDER BY ", " WITH "))
+    return kw >= 3
+
+def _best_text(obj: Any) -> Optional[str]:
+    """
+    Prefer FINAL_RESPONSE; otherwise choose a long, non-SQL natural text.
+    Falls back to the longest string if everything looks like SQL.
+    """
+    # 1) FINAL_RESPONSE block
+    for _, node in _walk(obj):
+        if isinstance(node, dict):
+            tt = node.get("textType")
+            parts = node.get("parts")
+            if isinstance(tt, str) and tt.upper() == "FINAL_RESPONSE" and isinstance(parts, list):
+                joined = "\n".join([p for p in parts if isinstance(p, str)]).strip()
+                if joined and not _looks_like_sql_text(joined):
+                    return joined
+
+    strings = _all_strings(obj)
+    if not strings:
+        return None
+
+    # Prefer multi-sentence non-SQL text
+    def score(s: str) -> int:
+        return (s.count(".") + s.count("\n")) * 1000 + len(s)
+
+    non_sql = [s for s in strings if not _looks_like_sql_text(s)]
+    if non_sql:
+        non_sql.sort(key=score, reverse=True)
+        return non_sql[0].strip()
+
+    # If all looked like SQL, pick the longest anyway
+    strings.sort(key=score, reverse=True)
+    return strings[0].strip()
+
+def _find_sql_snippets(obj: Any) -> List[str]:
+    """Find likely SQL segments anywhere in the structure."""
+    found = []
+    for s in _all_strings(obj):
+        m = _SQL_SNIPPET.search(s)
+        if m:
+            snippet = s[m.start():]
+            cut = snippet.split(";", 2)
+            snippet = ";".join(cut[:2]) + (";" if len(cut) > 1 else "")
+            found.append(snippet.strip())
+    # de-dup preserve order
+    seen, uniq = set(), []
+    for t in found:
+        if t not in seen:
+            uniq.append(t); seen.add(t)
+    return uniq
+
+def _find_table_refs(obj: Any) -> List[str]:
+    """Extract project.dataset.table patterns from any string."""
+    refs = []
+    for s in _all_strings(obj):
+        for m in _TABLE_FQN.finditer(s):
+            refs.append(".".join(m.groups()))
+    # de-dup preserve order
+    seen, uniq = set(), []
+    for r in refs:
+        if r not in seen:
+            uniq.append(r); seen.add(r)
+    return uniq
+
+def _looks_like_job_dict(d: Dict[str, Any]) -> bool:
+    """Loose heuristic for job-ish objects (no fixed field names)."""
+    if not isinstance(d, dict): return False
+    text = " ".join(map(str, d.keys())).lower()
+    return ("job" in text or "task" in text) and any(isinstance(v, (str, int)) for v in d.values())
+
+def _find_jobs(obj: Any) -> List[Dict[str, Any]]:
+    jobs = []
+    for _, node in _walk(obj):
+        if isinstance(node, dict) and _looks_like_job_dict(node):
+            jobs.append(node)
+    return jobs[:3]
+
+def _first_tabular_rows(obj: Any) -> Optional[List[Dict[str, Any]]]:
+    """Find the first list that looks like rows of simple dicts (no hardcoded keys)."""
+    for _, node in _walk(obj):
+        if isinstance(node, list) and node and all(isinstance(r, dict) for r in node):
+            rows: List[Dict[str, Any]] = []
+            simple = True
+            for r in node[:50]:
+                flat = {k: v for k, v in r.items() if isinstance(v, (str, int, float, type(None)))}
+                if not flat:
+                    simple = False
+                    break
+                rows.append(flat)
+            if simple and rows:
+                return rows
+    return None
+
+def _bullets_from_first_row(rows: Optional[List[Dict[str, Any]]]) -> Optional[str]:
+    """Generic bullet summary from the first tabular row (schema-agnostic)."""
+    if not rows or not isinstance(rows, list) or not rows:
+        return None
+    row = rows[0]
+    if not isinstance(row, dict) or not row:
+        return None
+    lines = ["Summary from first result row:"]
+    for k, v in row.items():
+        if isinstance(v, (str, int, float)) or v is None:
+            vv = "" if v is None else str(v)
+            lines.append(f"- {k}: {vv}")
+    return "\n".join(lines) if len(lines) > 1 else None
+
+# ---------------------- Chart extraction ----------------------
+def _looks_like_vegalite_spec(obj: Any) -> bool:
+    """Heuristic: vega-lite if $schema mentions vega-lite OR (data & encoding & mark present)."""
+    if not isinstance(obj, dict):
+        return False
+    schema = str(obj.get("$schema", "")).lower()
+    if "vega-lite" in schema:
+        return True
+    return all(k in obj for k in ("data", "encoding", "mark"))
+
+def _normalize_vegalite_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """Add a couple sane defaults for rendering."""
+    if "$schema" not in spec:
+        spec["$schema"] = "https://vega.github.io/schema/vega-lite/v5.json"
+    spec.setdefault("width", "container")
+    spec.setdefault("height", 260)
+    return spec
+
+def _extract_fenced_vegalite(answer_text: str) -> Tuple[List[Dict[str, Any]], List[Tuple[int, int]]]:
+    """Get vega-lite specs from fenced blocks; return specs and spans to remove."""
+    charts: List[Dict[str, Any]] = []
+    spans: List[Tuple[int, int]] = []
+    if not isinstance(answer_text, str):
+        return charts, spans
+
+    for m in FENCED_BLOCK_RE.finditer(answer_text):
+        lang = (m.group(1) or "").strip().lower()
+        code = m.group(2).strip()
+        if lang in ("vega-lite", "json", "vega", ""):
+            try:
+                spec = json.loads(code)
+                if _looks_like_vegalite_spec(spec):
+                    charts.append(_normalize_vegalite_spec(spec))
+                    spans.append(m.span())
+            except Exception:
+                pass
+    return charts, spans
+
+def _extract_json_blobs(answer_text: str) -> List[Tuple[str, Tuple[int, int]]]:
+    """
+    Scan the answer for balanced-JSON substrings (not only paragraph-delimited).
+    Returns list of (json_string, (start,end)) for candidates.
+    """
+    s = answer_text
+    n = len(s)
+    out: List[Tuple[str, Tuple[int, int]]] = []
+    i = 0
+    while i < n:
+        # find a '{'
+        start = s.find("{", i)
+        if start == -1:
+            break
+        # stack-based scan to find matching '}'
+        depth = 0
+        j = start
+        in_str = False
+        esc = False
+        while j < n:
+            ch = s[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == '\\':
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        # candidate substring
+                        cand = s[start:j+1]
+                        if 2 <= len(cand) <= 200_000:
+                            out.append((cand, (start, j+1)))
+                        i = j + 1
+                        break
+            j += 1
+        else:
+            # no closing brace found
+            break
+        i = max(i, start + 1)
+    return out
+
+def extract_charts_and_clean(answer_text: str, full_result: Any) -> Tuple[List[Dict[str, Any]], str]:
+    """
+    Collect charts from:
+      (A) fenced blocks in the answer,
+      (B) any balanced-JSON substrings in the answer that look like Vega-Lite,
+      (C) anywhere inside the full API result (walk the object and pick dicts that look like Vega-Lite).
+    Remove only the blocks found in the answer from the visible text.
+    """
+    if not isinstance(answer_text, str):
+        answer_text = str(answer_text or "")
+
+    charts: List[Dict[str, Any]] = []
+    remove_spans: List[Tuple[int, int]] = []
+
+    # (A) fenced
+    fenced_specs, spans = _extract_fenced_vegalite(answer_text)
+    charts.extend(fenced_specs)
+    remove_spans.extend(spans)
+
+    # Temporarily remove fenced spans to avoid double-detection
+    tmp = []
+    last = 0
+    for s0, s1 in sorted(remove_spans):
+        tmp.append(answer_text[last:s0])
+        last = s1
+    tmp.append(answer_text[last:])
+    text_wo_fenced = "".join(tmp)
+
+    # (B) balanced-JSON scan on remaining text
+    for cand, (s0, s1) in _extract_json_blobs(text_wo_fenced):
+        try:
+            obj = json.loads(cand)
+            if _looks_like_vegalite_spec(obj):
+                charts.append(_normalize_vegalite_spec(obj))
+                # map span back to original indexes by reconstructing index
+                # We recompute positions in the original text conservatively:
+                # find the first occurrence of cand inside answer_text and remove that slice.
+                pos = answer_text.find(cand)
+                if pos != -1:
+                    remove_spans.append((pos, pos + len(cand)))
+        except Exception:
+            pass
+
+    # (C) search the entire result object for embedded specs
+    for _, node in _walk(full_result):
+        if isinstance(node, dict) and _looks_like_vegalite_spec(node):
+            charts.append(_normalize_vegalite_spec(node))
+
+    # de-dup charts (by JSON string) while preserving order
+    seen = set()
+    deduped: List[Dict[str, Any]] = []
+    for c in charts:
+        key = json.dumps(c, sort_keys=True)
+        if key not in seen:
+            deduped.append(c)
+            seen.add(key)
+    charts = deduped
+
+    # Build cleaned answer (remove spans from original text)
+    cleaned_parts: List[str] = []
+    last = 0
+    for s0, s1 in sorted(remove_spans):
+        cleaned_parts.append(answer_text[last:s0])
+        last = s1
+    cleaned_parts.append(answer_text[last:])
+    cleaned_answer = "".join(cleaned_parts).strip()
+
+    return charts, cleaned_answer
+
+# --------- Multi-turn prompt builder ----------
+def _build_prompt_with_history(message: str, history: Optional[List[Dict[str, str]]], max_turns: int = 6) -> str:
+    """
+    Build a compact conversational context from the last N turns and append the current user question.
+    We keep a single userMessage to stay compatible with the current CA HTTP schema.
+    """
+    if not history:
+        return message.strip()
+
+    # take last N valid turns
+    tail = [h for h in history if isinstance(h, dict) and "role" in h and "content" in h][-max_turns:]
+
+    lines = ["Context from previous conversation:"]
+    for t in tail:
+        role = "User" if t["role"].lower() == "user" else "Assistant"
+        content = str(t["content"]).strip()
+        if content:
+            lines.append(f"{role}: {content}")
+    lines.append("")  # spacer
+    lines.append(f"User: {message.strip()}")
+    lines.append("Assistant:")
+
+    return "\n".join(lines).strip()
+
+# --------- Helpers for Google API ---------
+def ga_headers() -> Dict[str, str]:
+    """Get headers for Google API requests."""
+    token = get_access_token()
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "x-goog-user-project": BILLING_PROJECT,
+        "x-server-timeout": "600",
+    }
+
+def ga_get(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    """GET a resource from Google API (e.g., describe an agent or list agents)."""
+    url = f"{CA_BASE}/v1beta/{path}"
+    r = requests.get(url, headers=ga_headers(), params=params or {}, timeout=60)
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, r.text)
+    return r.json()
+
+def ga_patch(path: str, update_mask: str, payload: Dict[str, Any]) -> Any:
+    """PATCH a resource on Google API (e.g., update agent instruction)."""
+    url = f"{CA_BASE}/v1beta/{path}?updateMask={update_mask}"
+    r = requests.patch(url, headers=ga_headers(), json=payload, timeout=60)
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, r.text)
+    return r.json()
+
+def ga_post(path: str, payload: Dict[str, Any], params: Optional[Dict[str, Any]] = None) -> Any:
+    """POST to create a resource on Google API (e.g., create an agent)."""
+    url = f"{CA_BASE}/v1beta/{path}"
+    r = requests.post(url, headers=ga_headers(), json=payload, params=params or {}, timeout=60)
+    if r.status_code != 200:
+        # Extract detailed error message
+        error_detail = r.text
+        try:
+            error_json = r.json()
+            if isinstance(error_json, dict):
+                error_obj = error_json.get("error", {})
+                if isinstance(error_obj, dict):
+                    error_detail = error_obj.get("message", error_detail)
+        except:
+            pass
+        raise HTTPException(r.status_code, error_detail)
+    return r.json()
+
+def ga_delete(path: str, max_retries: int = 3, initial_delay: float = 2.0) -> Any:
+    """DELETE a resource from Google API (e.g., delete an agent).
+    
+    Includes retry logic for permission errors (403) which may occur due to
+    propagation delays after agent creation.
+    """
+    url = f"{CA_BASE}/v1beta/{path}"
+    
+    for attempt in range(max_retries):
+        r = requests.delete(url, headers=ga_headers(), timeout=60)
+        
+        # Success case
+        if r.status_code == 200:
+            # DELETE requests may return empty body on success (204) or JSON (200)
+            if r.text:
+                try:
+                    return r.json()
+                except:
+                    return {"success": True}
+            return {"success": True}
+        
+        # Extract detailed error message
+        error_detail = r.text
+        try:
+            error_json = r.json()
+            if isinstance(error_json, dict):
+                error_obj = error_json.get("error", {})
+                if isinstance(error_obj, dict):
+                    error_detail = error_obj.get("message", error_detail)
+        except:
+            pass
+        
+        # Check for soft-deleted state (409 Failed Precondition)
+        if r.status_code == 409 and "SOFT_DELETED" in error_detail:
+            # Agent is already soft-deleted, treat as success (it's effectively deleted)
+            logger.info(f"Agent {path} is already in SOFT_DELETED state, treating as successfully deleted")
+            return {"success": True, "already_deleted": True, "message": "Agent was already deleted (soft-deleted)"}
+        
+        # For permission errors (403), retry with exponential backoff
+        # This handles propagation delays after agent creation
+        if r.status_code == 403 and attempt < max_retries - 1:
+            delay = initial_delay * (2 ** attempt)  # Exponential backoff: 2s, 4s, 8s
+            logger.warning(f"Permission denied (403) on delete attempt {attempt + 1}/{max_retries}. "
+                         f"Retrying in {delay} seconds... Error: {error_detail[:100]}")
+            time.sleep(delay)
+            continue
+        
+        # For other errors or final attempt, raise exception
+        raise HTTPException(r.status_code, error_detail)
+    
+    # Should not reach here, but just in case
+    raise HTTPException(500, "Unexpected error in delete retry logic")
+
+def _bq_get(url: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    """Helper for BigQuery API GET requests."""
+    r = requests.get(url, headers=ga_headers(), params=params or {}, timeout=60)
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, r.text)
+    return r.json()
+
+# --------- GCP Sources Fetching (with precautions) ---------
+def _fetch_sources_from_gcp() -> Tuple[Optional[List[Dict[str, str]]], Optional[str]]:
+    """
+    Fetch data agents from GCP API.
+    Returns (sources_list, error_message) tuple.
+    - If successful: (sources_list, None)
+    - If error: (None, error_message)
+    """
+    if not ENABLE_GCP_FETCH:
+        logger.info("GCP sources fetching is disabled via ENABLE_GCP_SOURCES_FETCH")
+        return None, "GCP fetching is disabled"
+    
+    try:
+        # Build the list endpoint path (same pattern as ga_get uses)
+        path = f"projects/{BILLING_PROJECT}/locations/{LOCATION}/dataAgents"
+        url = f"{CA_BASE}/v1beta/{path}"
+        
+        logger.info(f"Fetching data agents from GCP: {url}")
+        
+        # Get headers (this might fail if credentials are missing)
+        try:
+            headers = ga_headers()
+        except Exception as e:
+            error_msg = f"Authentication failed: {str(e)}"
+            logger.error(error_msg)
+            return None, error_msg
+        
+        # Make request directly so we can parse error responses properly
+        try:
+            response = requests.get(
+                url,
+                headers=headers,
+                params={"pageSize": 100},
+                timeout=GCP_FETCH_TIMEOUT
+            )
+        except requests.Timeout:
+            error_msg = f"Request timed out after {GCP_FETCH_TIMEOUT} seconds"
+            logger.warning(error_msg)
+            return None, error_msg
+        except requests.ConnectionError as e:
+            error_msg = f"Connection error: {str(e)}"
+            logger.warning(error_msg)
+            return None, error_msg
+        except requests.RequestException as e:
+            error_msg = f"Request failed: {str(e)}"
+            logger.warning(error_msg)
+            return None, error_msg
+        
+        # Handle non-200 responses with detailed error extraction
+        if response.status_code != 200:
+            error_detail = "Unknown error"
+            try:
+                # Try to parse JSON error response
+                error_json = response.json()
+                logger.info(f"GCP API error response (status {response.status_code}): {json.dumps(error_json, indent=2)}")
+                
+                if isinstance(error_json, dict):
+                    # GCP API error format: {"error": {"code": 403, "message": "...", "status": "PERMISSION_DENIED"}}
+                    error_obj = error_json.get("error", {})
+                    if isinstance(error_obj, dict):
+                        error_detail = error_obj.get("message", "")
+                        if not error_detail:
+                            # Try other possible fields
+                            error_detail = error_obj.get("detail", "") or error_obj.get("reason", "") or str(error_obj)
+                        # Also include status code if available
+                        status = error_obj.get("status", "")
+                        if status:
+                            error_detail = f"{status}: {error_detail}"
+                    else:
+                        error_detail = str(error_obj)
+                else:
+                    error_detail = str(error_json)
+            except (json.JSONDecodeError, ValueError) as e:
+                # If not JSON, use the raw text
+                error_detail = response.text[:1000] if response.text else f"HTTP {response.status_code}"
+                logger.warning(f"Failed to parse error JSON: {e}, raw response: {error_detail[:200]}")
+            
+            error_msg = f"GCP API returned {response.status_code}: {error_detail}"
+            logger.warning(f"GCP API error: {error_msg}")
+            return None, error_msg
+        
+        # Parse successful JSON response
+        try:
+            data = response.json()
+            # Log the full response for debugging
+            logger.info(f"GCP API response received. Keys: {list(data.keys()) if isinstance(data, dict) else 'Not a dict'}")
+            logger.info(f"Full response (first 2000 chars): {json.dumps(data, indent=2)[:2000]}")
+        except json.JSONDecodeError as e:
+            error_msg = f"Failed to parse JSON response: {str(e)}. Response: {response.text[:500]}"
+            logger.warning(error_msg)
+            return None, error_msg
+        
+        # Validate response structure
+        if not isinstance(data, dict):
+            error_msg = f"GCP API returned invalid response structure (not a dict). Type: {type(data)}, Value: {str(data)[:500]}"
+            logger.warning(error_msg)
+            return None, error_msg
+        
+        # Extract agents from response - the field is "dataAgents" not "dataAnalyticsAgents"
+        agents = data.get("dataAgents", [])
+        if not agents:
+            # Try alternative field names for backward compatibility
+            agents = data.get("dataAnalyticsAgents", [])
+        if not agents:
+            # Try checking if it's a different structure
+            logger.warning(f"No 'dataAgents' or 'dataAnalyticsAgents' field found. Available keys: {list(data.keys())}")
+            logger.warning(f"Full response structure: {json.dumps(data, indent=2)[:3000]}")
+        
+        logger.info(f"GCP API returned {len(agents) if isinstance(agents, list) else 0} agents")
+        
+        if not isinstance(agents, list):
+            error_msg = f"GCP API returned invalid agents list. Type: {type(agents)}, Value: {str(agents)[:500]}"
+            logger.warning(f"{error_msg}. Response structure: {list(data.keys())}")
+            return None, error_msg
+        
+        if len(agents) == 0:
+            # Log the full response to understand what we got
+            logger.warning(f"GCP API returned 0 agents. Full response keys: {list(data.keys())}")
+            logger.warning(f"Full response: {json.dumps(data, indent=2)[:3000]}")
+            # Check if there's pagination info
+            if "nextPageToken" in data:
+                logger.info("Response has nextPageToken - there might be more agents on next page")
+        
+        # Transform GCP agents to extract their BigQuery data sources
+        sources = []
+        seen_sources = set()  # Track unique data sources to avoid duplicates
+        
+        for agent in agents:
+            try:
+                # Extract agent path (full resource name)
+                agent_path = agent.get("name", "")
+                if not agent_path:
+                    continue
+                
+                # Extract agent's data sources configuration
+                agent_data = agent.get("dataAnalyticsAgent", {})
+                data_sources = agent_data.get("dataSources", [])
+                
+                # Extract display name for the agent
+                display_name = agent.get("displayName", "")
+                if not display_name:
+                    # Extract agent ID from path: projects/.../dataAgents/ID
+                    parts = agent_path.split("/")
+                    display_name = parts[-1] if parts else "Unknown Agent"
+                
+                # Process each data source in the agent
+                for ds in data_sources:
+                    bigquery_ds = ds.get("bigquery", {})
+                    if not bigquery_ds:
+                        continue
+                    
+                    project_id = bigquery_ds.get("projectId", "")
+                    dataset_id = bigquery_ds.get("datasetId", "")
+                    table_id = bigquery_ds.get("tableId", "")
+                    
+                    if not project_id or not dataset_id:
+                        continue
+                    
+                    # Create a unique key for this data source
+                    if table_id:
+                        source_key = f"{project_id}.{dataset_id}.{table_id}"
+                        source_label = f"{dataset_id}.{table_id}"
+                    else:
+                        source_key = f"{project_id}.{dataset_id}"
+                        source_label = f"{dataset_id} (dataset)"
+                    
+                    # Avoid duplicates
+                    if source_key in seen_sources:
+                        continue
+                    seen_sources.add(source_key)
+                    
+                    # Check for custom label for this agent, use it as prefix if available
+                    agent_id = agent_path.split("/")[-1]
+                    agent_key = f"agent_{agent_id}"
+                    custom_label = AGENT_LABELS.get(agent_id) or AGENT_LABELS.get(agent_key)
+                    # If custom label exists, use it; otherwise use the dataset.table format
+                    final_label = custom_label if custom_label else source_label
+                    
+                    # Create source entry
+                    sources.append({
+                        "key": source_key,
+                        "label": final_label,
+                        "agent": agent_path,  # Keep reference to the agent
+                        "table": source_key,  # Full table path
+                        "source": "gcp",  # Mark as from GCP
+                        "project": project_id,
+                        "dataset": dataset_id,
+                        "table_name": table_id if table_id else None
+                    })
+                
+                # If agent has no data sources configured, still add it as a source using agent info
+                if not data_sources:
+                    agent_id = agent_path.split("/")[-1]
+                    agent_key = f"agent_{agent_id}"
+                    if agent_key not in seen_sources:
+                        seen_sources.add(agent_key)
+                        # Check for custom label first, then use displayName
+                        custom_label = AGENT_LABELS.get(agent_id) or AGENT_LABELS.get(agent_key)
+                        final_label = custom_label if custom_label else display_name
+                        
+                        sources.append({
+                            "key": agent_key,
+                            "label": final_label,
+                            "agent": agent_path,
+                            "source": "gcp",
+                            "table": None
+                        })
+                        
+            except Exception as e:
+                logger.warning(f"Error processing agent from GCP: {e}")
+                continue
+        
+        if len(sources) == 0:
+            # Check if we had agents but they had no data sources configured
+            if len(agents) > 0:
+                logger.warning(f"GCP API returned {len(agents)} agents but none have BigQuery data sources configured")
+                return sources, f"Found {len(agents)} agents but none have BigQuery data sources configured"
+            else:
+                logger.info("GCP API call succeeded but returned 0 data agents. No agents exist in this project/location.")
+                return sources, "No data analytics agents found in this project/location"
+        else:
+            logger.info(f"Successfully extracted {len(sources)} data sources from {len(agents)} GCP agents")
+            return sources, None
+        
+    except Exception as e:
+        error_msg = f"Unexpected error: {str(e)}"
+        logger.error(f"Unexpected error fetching from GCP: {error_msg}", exc_info=True)
+        return None, error_msg
+
+def _get_cached_gcp_sources() -> Tuple[Optional[List[Dict[str, str]]], Optional[str]]:
+    """Get cached GCP sources if still valid, otherwise None. Returns (sources, error)."""
+    global _gcp_sources_cache, _gcp_sources_cache_time, _gcp_sources_error
+    
+    if _gcp_sources_cache is None:
+        return None, _gcp_sources_error
+    
+    # Check if cache is still valid
+    if time.time() - _gcp_sources_cache_time > GCP_CACHE_TTL:
+        _gcp_sources_cache = None
+        return None, _gcp_sources_error
+    
+    return _gcp_sources_cache, None
+
+def _set_cached_gcp_sources(sources: List[Dict[str, str]], error: Optional[str] = None) -> None:
+    """Cache GCP sources with current timestamp."""
+    global _gcp_sources_cache, _gcp_sources_cache_time, _gcp_sources_error
+    _gcp_sources_cache = sources
+    _gcp_sources_cache_time = time.time()
+    _gcp_sources_error = error
+
+def _invalidate_gcp_cache() -> None:
+    """Invalidate the GCP sources cache."""
+    global _gcp_sources_cache, _gcp_sources_cache_time, _gcp_sources_error
+    _gcp_sources_cache = None
+    _gcp_sources_cache_time = 0
+    _gcp_sources_error = None
+
+# --------- CA call ----------
+def ca_chat_with_agent_context(agent_path: str, messages: List[Dict[str, str]]) -> Any:
+    """
+    Call CA API using the project-level :chat endpoint, referencing a Data Agent.
+    """
+    url = f"{CA_BASE}/v1beta/projects/{BILLING_PROJECT}/locations/{LOCATION}:chat"
+    token = get_access_token()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "x-goog-user-project": BILLING_PROJECT,
+        "x-server-timeout": "600",
+    }
+    payload = {
+        "parent": f"projects/{BILLING_PROJECT}/locations/{LOCATION}",
+        "messages": [{"userMessage": {"text": m["text"]}} for m in messages],
+        "data_agent_context": {"data_agent": agent_path},
+    }
+    resp = requests.post(url, headers=headers, json=payload, timeout=600)
+    if resp.status_code != 200:
+        raise HTTPException(resp.status_code, resp.text)
+    return resp.json()
+
+# --------- Routes ----------
+@app.get("/")
+def root():
+    """Serve the UI (index.html in the same folder)."""
+    if os.path.exists("index.html"):
+        return FileResponse("index.html")
+    return {"message": "Backend is up. Put index.html next to main.py to serve the UI."}
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "project": BILLING_PROJECT, "location": LOCATION}
+
+# --------- Agent Management APIs ---------
+def _fetch_agents_from_gcp() -> Tuple[Optional[List[Dict[str, str]]], Optional[str]]:
+    """
+    Fetch agents directly from GCP API (not data sources).
+    Returns (agents_list, error_message) tuple.
+    - If successful: (agents_list, None)
+    - If error: (None, error_message)
+    """
+    if not ENABLE_GCP_FETCH:
+        logger.info("GCP agents fetching is disabled via ENABLE_GCP_SOURCES_FETCH")
+        return None, "GCP fetching is disabled"
+    
+    try:
+        # Build the list endpoint path
+        path = f"projects/{BILLING_PROJECT}/locations/{LOCATION}/dataAgents"
+        url = f"{CA_BASE}/v1beta/{path}"
+        
+        logger.info(f"Fetching agents from GCP: {url}")
+        
+        # Get headers
+        try:
+            headers = ga_headers()
+        except Exception as e:
+            error_msg = f"Authentication failed: {str(e)}"
+            logger.error(error_msg)
+            return None, error_msg
+        
+        # Make request
+        try:
+            response = requests.get(
+                url,
+                headers=headers,
+                params={"pageSize": 100},
+                timeout=GCP_FETCH_TIMEOUT
+            )
+        except requests.Timeout:
+            error_msg = f"Request timed out after {GCP_FETCH_TIMEOUT} seconds"
+            logger.warning(error_msg)
+            return None, error_msg
+        except requests.ConnectionError as e:
+            error_msg = f"Connection error: {str(e)}"
+            logger.warning(error_msg)
+            return None, error_msg
+        except requests.RequestException as e:
+            error_msg = f"Request failed: {str(e)}"
+            logger.warning(error_msg)
+            return None, error_msg
+        
+        # Handle non-200 responses
+        if response.status_code != 200:
+            error_detail = "Unknown error"
+            try:
+                error_json = response.json()
+                logger.info(f"GCP API error response (status {response.status_code}): {json.dumps(error_json, indent=2)}")
+                
+                if isinstance(error_json, dict):
+                    error_obj = error_json.get("error", {})
+                    if isinstance(error_obj, dict):
+                        error_detail = error_obj.get("message", "")
+                        if not error_detail:
+                            error_detail = error_obj.get("detail", "") or error_obj.get("reason", "") or str(error_obj)
+                        status = error_obj.get("status", "")
+                        if status:
+                            error_detail = f"{status}: {error_detail}"
+                    else:
+                        error_detail = str(error_obj)
+                else:
+                    error_detail = str(error_json)
+            except (json.JSONDecodeError, ValueError) as e:
+                error_detail = response.text[:1000] if response.text else f"HTTP {response.status_code}"
+                logger.warning(f"Failed to parse error JSON: {e}, raw response: {error_detail[:200]}")
+            
+            error_msg = f"GCP API returned {response.status_code}: {error_detail}"
+            logger.warning(f"GCP API error: {error_msg}")
+            return None, error_msg
+        
+        # Parse successful JSON response
+        try:
+            data = response.json()
+            logger.info(f"GCP API response received. Keys: {list(data.keys()) if isinstance(data, dict) else 'Not a dict'}")
+        except json.JSONDecodeError as e:
+            error_msg = f"Failed to parse JSON response: {str(e)}. Response: {response.text[:500]}"
+            logger.warning(error_msg)
+            return None, error_msg
+        
+        # Validate response structure
+        if not isinstance(data, dict):
+            error_msg = f"GCP API returned invalid response structure (not a dict). Type: {type(data)}, Value: {str(data)[:500]}"
+            logger.warning(error_msg)
+            return None, error_msg
+        
+        # Extract agents from response - the field is "dataAgents"
+        agents = data.get("dataAgents", [])
+        if not agents:
+            # Try alternative field names for backward compatibility
+            agents = data.get("dataAnalyticsAgents", [])
+        
+        logger.info(f"GCP API returned {len(agents) if isinstance(agents, list) else 0} agents")
+        
+        if not isinstance(agents, list):
+            error_msg = f"GCP API returned invalid agents list. Type: {type(agents)}, Value: {str(agents)[:500]}"
+            logger.warning(f"{error_msg}. Response structure: {list(data.keys())}")
+            return None, error_msg
+        
+        # Transform GCP agents to agent list format
+        agent_list = []
+        for agent in agents:
+            try:
+                # Extract agent path (full resource name)
+                agent_path = agent.get("name", "")
+                if not agent_path:
+                    continue
+                
+                # Extract display name for the agent
+                display_name = agent.get("displayName", "")
+                if not display_name:
+                    # Extract agent ID from path: projects/.../dataAgents/ID
+                    parts = agent_path.split("/")
+                    display_name = parts[-1] if parts else "Unknown Agent"
+                
+                # Extract agent ID for key
+                agent_id = agent_path.split("/")[-1]
+                agent_key = f"agent_{agent_id}"
+                
+                # Check for custom label first, then use displayName
+                agent_id = agent_path.split("/")[-1]
+                custom_label = AGENT_LABELS.get(agent_id) or AGENT_LABELS.get(agent_key)
+                final_label = custom_label if custom_label else display_name
+                
+                agent_list.append({
+                    "key": agent_key,
+                    "label": final_label,
+                    "agent": agent_path,
+                    "source": "gcp",  # Mark as from GCP
+                })
+            except Exception as e:
+                logger.warning(f"Error processing agent from GCP: {e}")
+                continue
+        
+        if len(agent_list) == 0:
+            logger.info("GCP API call succeeded but returned 0 agents")
+            return agent_list, "No data analytics agents found in this project/location"
+        else:
+            logger.info(f"Successfully fetched {len(agent_list)} agents from GCP")
+            return agent_list, None
+        
+    except Exception as e:
+        error_msg = f"Unexpected error: {str(e)}"
+        logger.error(f"Unexpected error fetching agents from GCP: {error_msg}", exc_info=True)
+        return None, error_msg
+
+@app.get("/api/agents")
+def list_agents():
+    """List agents from both ca_profiles.json and GCP (key/label/agent path)."""
+    out = []
+    gcp_error = None
+    gcp_status = "unknown"
+    
+    # First, collect GCP agents (source of truth)
+    gcp_agent_paths = set()
+    gcp_agents_list = []
+    
+    try:
+        gcp_agents, gcp_error = _fetch_agents_from_gcp()
+        
+        if gcp_agents is not None:
+            # gcp_agents can be [] (empty list) or list with agents
+            if len(gcp_agents) > 0:
+                gcp_status = "success"
+                logger.info(f"GCP agents fetched: {len(gcp_agents)}")
+                for agent in gcp_agents:
+                    agent_path = agent.get("agent", "")
+                    if agent_path:
+                        gcp_agent_paths.add(agent_path)
+                        gcp_agents_list.append({
+                            "key": agent.get("key", ""),
+                            "label": agent.get("label", ""),
+                            "agent": agent_path,
+                            "source": "gcp",  # Mark as from GCP
+                        })
+                        logger.info(f"Added GCP agent: key={agent.get('key')}, label={agent.get('label')}, path={agent_path}")
+                    else:
+                        logger.warning(f"Skipping GCP agent (no agent path): {agent.get('key')}")
+            else:
+                # Empty list - no agents found
+                gcp_status = "empty"
+                if gcp_error:
+                    logger.warning(f"GCP fetch returned 0 agents: {gcp_error}")
+                else:
+                    logger.info("GCP fetch returned 0 agents (no error)")
+        else:
+            # gcp_agents is None - error occurred
+            gcp_status = "failed"
+            if gcp_error:
+                logger.error(f"Failed to fetch GCP agents: {gcp_error}")
+            else:
+                gcp_error = "Unknown error - no error message captured"
+                logger.error("Failed to fetch GCP agents but no error message was returned")
+    except Exception as e:
+        # Log error but don't fail the request - still return local agents
+        gcp_status = "failed"
+        gcp_error = f"Unexpected error: {str(e)}"
+        logger.error(f"Error fetching GCP agents: {gcp_error}", exc_info=True)
+    
+    # Add GCP agents first (source of truth)
+    out.extend(gcp_agents_list)
+    
+    # Add local agents that are NOT in GCP (to avoid duplicates, prefer GCP)
+    for key, v in PROFILES.items():
+        agent_path = v.get("agent", "")
+        if agent_path and agent_path not in gcp_agent_paths:
+            # Check for custom label first, then use ca_profiles.json label
+            agent_id = agent_path.split("/")[-1] if agent_path else ""
+            custom_label = AGENT_LABELS.get(agent_id) or AGENT_LABELS.get(key)
+            final_label = custom_label if custom_label else v.get("label", key)
+            
+            out.append({
+                "key": key,
+                "label": final_label,
+                "agent": agent_path,
+                "source": "local",  # Mark as local
+            })
+            logger.info(f"Added local agent (not in GCP): key={key}, path={agent_path}")
+        else:
+            if agent_path in gcp_agent_paths:
+                logger.info(f"Skipping local agent (exists in GCP): key={key}, path={agent_path}")
+    
+    # Return agents with metadata about GCP fetch status
+    return {
+        "agents": out,
+        "meta": {
+            "gcp_status": gcp_status,
+            "gcp_error": gcp_error,
+            "gcp_count": len(gcp_agents_list),
+            "local_count": len([a for a in out if a.get("source") == "local"]),
+            "total": len(out)
+        }
+    }
+
+def _find_agent_path_by_id(agent_id: str) -> Optional[str]:
+    """
+    Find agent path by agent ID (last segment).
+    Checks both local PROFILES and GCP sources.
+    Returns the agent path if found, None otherwise.
+    """
+    # First check local PROFILES
+    for v in PROFILES.values():
+        ap = v.get("agent")
+        if ap and ap.split("/")[-1] == agent_id:
+            return ap
+    
+    # If not found locally, check GCP sources (from cache or fetch)
+    gcp_sources, _ = _get_cached_gcp_sources()
+    if gcp_sources is None:
+        gcp_sources, _ = _fetch_sources_from_gcp()
+        if gcp_sources is not None:
+            _set_cached_gcp_sources(gcp_sources, None)
+    
+    if gcp_sources:
+        for src in gcp_sources:
+            ap = src.get("agent", "")
+            if ap and ap.split("/")[-1] == agent_id:
+                return ap
+    
+    return None
+
+@app.get("/api/agents/{agent_id}")
+def describe_agent(agent_id: str):
+    """Describe an agent by its ID (last path segment) via GCP."""
+    agent_path = _find_agent_path_by_id(agent_id)
+    if not agent_path:
+        raise HTTPException(404, f"Agent id '{agent_id}' not found in local profiles or GCP")
+    return ga_get(agent_path)
+
+@app.patch("/api/agents/{agent_id}/instruction")
+def patch_instruction(agent_id: str, body: InstructionPatch):
+    """Update published system instruction for the agent on GCP."""
+    agent_path = _find_agent_path_by_id(agent_id)
+    if not agent_path:
+        raise HTTPException(404, f"Agent id '{agent_id}' not found in local profiles or GCP")
+
+    update_mask = "dataAnalyticsAgent.publishedContext.systemInstruction"
+    user_instruction = (body.instruction or "").strip()
+    payload = {
+        "dataAnalyticsAgent": {
+            "publishedContext": {
+                "systemInstruction": user_instruction + GUARD_RAILS
+            }
+        }
+    }
+    return ga_patch(agent_path, update_mask, payload)
+
+@app.delete("/api/agents/{agent_id}")
+def delete_agent(agent_id: str, agent_path: Optional[str] = Query(None, description="Optional agent path to bypass lookup")):
+    """Delete a Data Analytics Agent from GCP.
+    
+    Accepts optional query parameter 'agent_path' to bypass lookup.
+    This is useful when the agent was just created and might not be in cache yet.
+    """
+    # If agent_path is provided as query parameter, use it directly (bypass lookup)
+    if agent_path:
+        logger.info(f"Using provided agent_path for deletion: {agent_path}")
+    
+    # Otherwise, try to find the agent path
+    if not agent_path:
+        agent_path = _find_agent_path_by_id(agent_id)
+        
+        # If still not found, try with a short delay and retry (for newly created agents)
+        if not agent_path:
+            logger.warning(f"Agent {agent_id} not found in cache, waiting 2 seconds and retrying...")
+            time.sleep(2)
+            # Invalidate cache and retry
+            _invalidate_gcp_cache()
+            agent_path = _find_agent_path_by_id(agent_id)
+    
+    if not agent_path:
+        raise HTTPException(404, f"Agent id '{agent_id}' not found in local profiles or GCP. The agent may not have propagated yet. Please try again in a few moments.")
+    
+    logger.info(f"Deleting agent: {agent_id} at {agent_path}")
+    
+    try:
+        # Call GCP API to delete the agent (with retry logic for permission errors)
+        result = ga_delete(agent_path, max_retries=3, initial_delay=2.0)
+        
+        # Check if agent was already soft-deleted
+        if result.get("already_deleted"):
+            logger.info(f"Agent {agent_id} was already soft-deleted")
+            # Still invalidate cache and remove label
+            _invalidate_gcp_cache()
+            if agent_id in AGENT_LABELS:
+                try:
+                    del AGENT_LABELS[agent_id]
+                    with open(AGENT_LABELS_PATH, "w") as f:
+                        json.dump(AGENT_LABELS, f, indent=2)
+                except Exception as e:
+                    logger.warning(f"Failed to remove custom label: {e}")
+            
+            return {
+                "success": True,
+                "agent_id": agent_id,
+                "agent_path": agent_path,
+                "message": f"Agent '{agent_id}' was already deleted (soft-deleted)"
+            }
+        
+        logger.info(f"Successfully deleted agent: {agent_path}")
+        
+        # Invalidate cache after deletion so list refreshes
+        _invalidate_gcp_cache()
+        
+        # Also remove custom label if it exists
+        if agent_id in AGENT_LABELS:
+            try:
+                del AGENT_LABELS[agent_id]
+                with open(AGENT_LABELS_PATH, "w") as f:
+                    json.dump(AGENT_LABELS, f, indent=2)
+            except Exception as e:
+                logger.warning(f"Failed to remove custom label: {e}")
+        
+        return {
+            "success": True,
+            "agent_id": agent_id,
+            "agent_path": agent_path,
+            "message": f"Agent '{agent_id}' deleted successfully"
+        }
+    except HTTPException as e:
+        # Provide helpful error messages for common cases
+        error_detail = str(e.detail)
+        
+        # Check if it's a soft-deleted state error (409)
+        if e.status_code == 409 and "SOFT_DELETED" in error_detail:
+            # Agent is already soft-deleted, treat as success
+            logger.info(f"Agent {agent_id} is already soft-deleted")
+            _invalidate_gcp_cache()
+            if agent_id in AGENT_LABELS:
+                try:
+                    del AGENT_LABELS[agent_id]
+                    with open(AGENT_LABELS_PATH, "w") as f:
+                        json.dump(AGENT_LABELS, f, indent=2)
+                except Exception as e:
+                    logger.warning(f"Failed to remove custom label: {e}")
+            
+            return {
+                "success": True,
+                "agent_id": agent_id,
+                "agent_path": agent_path,
+                "message": f"Agent '{agent_id}' was already deleted (soft-deleted)"
+            }
+        
+        # Check if it's a permission error
+        if e.status_code == 403:
+            if "Permission" in error_detail and "denied" in error_detail:
+                # Check if it might be a propagation delay issue
+                if "may not exist" in error_detail:
+                    error_msg = (
+                        f"Permission denied. This may be due to a propagation delay after agent creation. "
+                        f"Please wait a few moments and try again. "
+                        f"Original error: {error_detail}"
+                    )
+                else:
+                    error_msg = (
+                        f"Permission denied. The service account may not have the required "
+                        f"'geminidataanalytics.dataAgents.delete' permission, or there may be a propagation delay. "
+                        f"Please check permissions or try again in a few moments. "
+                        f"Original error: {error_detail}"
+                    )
+            else:
+                error_msg = f"Permission denied: {error_detail}"
+        elif e.status_code == 404:
+            error_msg = (
+                f"Agent not found. The agent may not have propagated yet after creation. "
+                f"Please try again in a few moments. Original error: {error_detail}"
+            )
+        else:
+            error_msg = error_detail
+        
+        logger.error(f"Failed to delete agent {agent_id}: {error_msg}")
+        raise HTTPException(e.status_code, error_msg)
+    except Exception as e:
+        # Handle unexpected errors
+        error_msg = f"Unexpected error deleting agent: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        raise HTTPException(500, error_msg)
+
+@app.patch("/api/agents/{agent_id}/label")
+def update_agent_label(agent_id: str, body: Dict[str, str]):
+    """Update an agent's custom label in agent_labels.json. Works for both local and GCP agents."""
+    new_label = body.get("label", "").strip()
+    if not new_label:
+        raise HTTPException(400, "Label cannot be empty")
+    
+    # Update in-memory cache
+    AGENT_LABELS[agent_id] = new_label
+    
+    # Write back to file
+    try:
+        with open(AGENT_LABELS_PATH, "w") as f:
+            json.dump(AGENT_LABELS, f, indent=2)
+        logger.info(f"Updated label for agent {agent_id}: {new_label}")
+        return {"agent_id": agent_id, "label": new_label}
+    except Exception as e:
+        raise HTTPException(500, f"Failed to update agent_labels.json: {e}")
+
+@app.post("/api/agents")
+def create_agent_endpoint(body: CreateAgentBody):
+    """Create a new Data Analytics Agent in GCP."""
+    # Validate agent ID format
+    agent_id = body.id.strip()
+    if not agent_id:
+        raise HTTPException(400, "Agent ID cannot be empty")
+    
+    # Validate slug format (lowercase letters, numbers, hyphens, underscores)
+    if not re.match(r'^[a-z0-9_-]+$', agent_id):
+        raise HTTPException(400, "Agent ID must contain only lowercase letters, numbers, hyphens, or underscores")
+    
+    # Validate label
+    label = body.label.strip()
+    if not label:
+        raise HTTPException(400, "Label cannot be empty")
+    
+    # Validate dataAnalyticsAgent structure
+    if not isinstance(body.dataAnalyticsAgent, dict):
+        raise HTTPException(400, "dataAnalyticsAgent must be an object")
+    
+    # Validate that dataSources exist if provided
+    if "dataSources" in body.dataAnalyticsAgent:
+        data_sources = body.dataAnalyticsAgent.get("dataSources", [])
+        if not isinstance(data_sources, list):
+            raise HTTPException(400, "dataSources must be an array")
+        if len(data_sources) == 0:
+            raise HTTPException(400, "At least one data source is required")
+    
+    # Build the create endpoint path
+    parent_path = f"projects/{BILLING_PROJECT}/locations/{LOCATION}"
+    create_path = f"{parent_path}/dataAgents"
+    
+    # Prepare the payload for GCP API
+    # GCP API expects camelCase field names (not snake_case)
+    # The structure matches what we use for PATCH operations
+    
+    # Build publishedContext with system instruction (guard rails appended automatically)
+    published_context = {}
+    if "publishedContext" in body.dataAnalyticsAgent:
+        pub_ctx = body.dataAnalyticsAgent["publishedContext"]
+        if "systemInstruction" in pub_ctx:
+            user_instruction = (pub_ctx["systemInstruction"] or "").strip()
+            published_context["systemInstruction"] = user_instruction + GUARD_RAILS
+    
+    # Build datasourceReferences from dataSources
+    # The API expects datasourceReferences inside publishedContext
+    if "dataSources" in body.dataAnalyticsAgent:
+        data_sources = body.dataAnalyticsAgent["dataSources"]
+        if data_sources and len(data_sources) > 0:
+            # Collect all BigQuery table references
+            table_refs = []
+            for ds in data_sources:
+                if "bigquery" in ds:
+                    bq = ds["bigquery"]
+                    project_id = bq.get("projectId", "")
+                    dataset_id = bq.get("datasetId", "")
+                    table_id = bq.get("tableId", "")
+                    
+                    if project_id and dataset_id:
+                        if table_id:
+                            # Specific table reference
+                            table_refs.append({
+                                "projectId": project_id,
+                                "datasetId": dataset_id,
+                                "tableId": table_id
+                            })
+                        else:
+                            # Dataset-level reference (no specific table)
+                            table_refs.append({
+                                "projectId": project_id,
+                                "datasetId": dataset_id
+                            })
+            
+            # Add datasourceReferences to publishedContext
+            if table_refs:
+                # The API expects bq with tableReferences array
+                bq_datasource = {
+                    "tableReferences": table_refs
+                }
+                published_context["datasourceReferences"] = {
+                    "bq": bq_datasource
+                }
+    
+    # Build the dataAnalyticsAgent object
+    data_analytics_agent = {}
+    
+    # Add publishedContext (required)
+    if published_context:
+        data_analytics_agent["publishedContext"] = published_context
+    
+    # Build the final payload structure
+    # The API expects DataAgent object with camelCase fields
+    # displayName is at the root level of DataAgent, NOT inside dataAnalyticsAgent
+    gcp_payload = {
+        "displayName": label,  # displayName at root level of DataAgent (camelCase)
+        "dataAnalyticsAgent": data_analytics_agent
+    }
+    
+    # Query parameter for agent ID (required by GCP API)
+    # Use camelCase for the parameter name (matches API convention)
+    params = {"dataAgentId": agent_id}
+    
+    logger.info(f"Creating agent: {agent_id} at {create_path}")
+    logger.debug(f"Payload structure: {json.dumps(gcp_payload, indent=2)[:1000]}")
+    
+    try:
+        # Call GCP API to create the agent
+        result = ga_post(create_path, gcp_payload, params=params)
+        
+        # Extract the created agent path from response
+        created_agent_path = result.get("name", f"{create_path}/{agent_id}")
+        
+        logger.info(f"Successfully created agent: {created_agent_path}")
+        
+        # Invalidate GCP cache so the new agent appears in lists
+        _invalidate_gcp_cache()
+        
+        # Optionally save custom label if different from displayName
+        if label and label != agent_id:
+            try:
+                AGENT_LABELS[agent_id] = label
+                with open(AGENT_LABELS_PATH, "w") as f:
+                    json.dump(AGENT_LABELS, f, indent=2)
+            except Exception as e:
+                logger.warning(f"Failed to save custom label: {e}")
+        
+        return {
+            "success": True,
+            "agent_id": agent_id,
+            "agent_path": created_agent_path,
+            "label": label,
+            "message": f"Agent '{agent_id}' created successfully"
+        }
+    except HTTPException as e:
+        # Give a clear message when GCP says the agent ID already exists (e.g. reserved after delete)
+        detail = e.detail
+        if isinstance(detail, dict):
+            detail = detail.get("message", detail.get("detail", str(detail)))
+        detail = str(detail or "")
+        if e.status_code == 409 or "already exists" in detail.lower():
+            raise HTTPException(
+                409,
+                f"An agent with ID '{agent_id}' already exists or that ID is still reserved (e.g. after a recent delete). "
+                "Please use a different agent ID."
+            )
+        logger.error(f"Failed to create agent {agent_id}: {e.detail}")
+        raise
+    except Exception as e:
+        # Handle unexpected errors
+        error_msg = f"Unexpected error creating agent: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        raise HTTPException(500, error_msg)
+
+@app.patch("/api/profiles/{profile_key}")
+def update_profile_label(profile_key: str, body: Dict[str, str]):
+    """Update a profile's label in ca_profiles.json."""
+    if profile_key not in PROFILES:
+        raise HTTPException(404, f"Profile '{profile_key}' not found")
+    
+    new_label = body.get("label", "").strip()
+    if not new_label:
+        raise HTTPException(400, "Label cannot be empty")
+    
+    PROFILES[profile_key]["label"] = new_label
+    
+    # Write back to file
+    try:
+        with open(PROFILES_PATH, "w") as f:
+            json.dump(PROFILES, f, indent=2)
+        return {"key": profile_key, "label": new_label}
+    except Exception as e:
+        raise HTTPException(500, f"Failed to update ca_profiles.json: {e}")
+
+@app.delete("/api/profiles/{profile_key}")
+def remove_profile(profile_key: str):
+    """Remove a profile from ca_profiles.json."""
+    if profile_key not in PROFILES:
+        raise HTTPException(404, f"Profile '{profile_key}' not found")
+    
+    del PROFILES[profile_key]
+    
+    # Write back to file
+    try:
+        with open(PROFILES_PATH, "w") as f:
+            json.dump(PROFILES, f, indent=2)
+        return {"message": f"Profile '{profile_key}' removed"}
+    except Exception as e:
+        raise HTTPException(500, f"Failed to update ca_profiles.json: {e}")
+
+# --------- BigQuery APIs ---------
+@app.get("/api/bq/projects")
+def bq_list_projects():
+    """Lists BigQuery projects visible to the service account."""
+    url = f"{BQ_API}/projects"
+    projects = []
+    page_token = None
+    while True:
+        data = _bq_get(url, params={"maxResults": 1000, "pageToken": page_token})
+        for p in data.get("projects", []):
+            projects.append({"id": p.get("id"), "friendlyName": p.get("friendlyName")})
+        page_token = data.get("nextPageToken")
+        if not page_token or len(projects) >= 2000:
+            break
+    return projects
+
+@app.get("/api/bq/datasets")
+def bq_list_datasets(project: str):
+    """Lists datasets within a project."""
+    if not project:
+        raise HTTPException(400, "project is required")
+    url = f"{BQ_API}/projects/{project}/datasets"
+    datasets = []
+    page_token = None
+    while True:
+        data = _bq_get(url, params={"all": False, "maxResults": 1000, "pageToken": page_token})
+        for d in data.get("datasets", []):
+            ref = d.get("datasetReference", {})
+            datasets.append({"id": ref.get("datasetId")})
+        page_token = data.get("nextPageToken")
+        if not page_token or len(datasets) >= 5000:
+            break
+    return datasets
+
+@app.get("/api/bq/tables")
+def bq_list_tables(project: str, dataset: str):
+    """Lists tables in a dataset (optional selection)."""
+    if not project or not dataset:
+        raise HTTPException(400, "project and dataset are required")
+    url = f"{BQ_API}/projects/{project}/datasets/{dataset}/tables"
+    tables = []
+    page_token = None
+    while True:
+        data = _bq_get(url, params={"maxResults": 1000, "pageToken": page_token})
+        for t in data.get("tables", []):
+            ref = t.get("tableReference", {})
+            tables.append({"id": ref.get("tableId")})
+        page_token = data.get("nextPageToken")
+        if not page_token or len(tables) >= 10000:
+            break
+    return tables
+
+@app.get("/api/bq/table-schema")
+def bq_get_table_schema(project: str, dataset: str, table: str):
+    """Returns the schema (field names and types) for a BigQuery table."""
+    if not project or not dataset or not table:
+        raise HTTPException(400, "project, dataset, and table are required")
+    url = f"{BQ_API}/projects/{project}/datasets/{dataset}/tables/{table}"
+    data = _bq_get(url)
+    schema = data.get("schema", {})
+    fields = schema.get("fields", [])
+    return {
+        "tableId": table,
+        "fields": [{"name": f.get("name"), "type": f.get("type", "STRING"), "mode": f.get("mode", "NULLABLE")} for f in fields]
+    }
+
+@app.get("/api/sources")
+def list_sources(force_refresh: bool = Query(False, description="Force refresh from GCP, bypassing cache")):
+    """
+    List data sources by fetching Data Analytics Agents from GCP.
+    Data sources are the Data Analytics Agents available in the GCP project.
+    Falls back to ca_profiles.json only if GCP fetch fails.
+    """
+    sources = []
+    gcp_count = 0
+    gcp_status = "disabled"
+    gcp_error = None
+    
+    # Try to get GCP sources (with caching)
+    if force_refresh:
+        # Force fresh fetch, clear cache
+        global _gcp_sources_cache, _gcp_sources_cache_time, _gcp_sources_error
+        _gcp_sources_cache = None
+        _gcp_sources_cache_time = 0
+        _gcp_sources_error = None
+        gcp_sources, gcp_error = _fetch_sources_from_gcp()
+        if gcp_sources is not None:
+            # gcp_sources can be [] (empty list = success but no agents) or list with agents
+            _set_cached_gcp_sources(gcp_sources, gcp_error)
+        elif gcp_error:
+            # Error occurred, cache the error
+            _set_cached_gcp_sources([], gcp_error)
+    else:
+        gcp_sources, cached_error = _get_cached_gcp_sources()
+        if gcp_sources is None:
+            # Cache miss or expired, fetch fresh
+            gcp_sources, gcp_error = _fetch_sources_from_gcp()
+            if gcp_sources is not None:
+                # gcp_sources can be [] (empty list = success but no agents) or list with agents
+                _set_cached_gcp_sources(gcp_sources, gcp_error)
+            elif gcp_error:
+                # Error occurred, cache the error
+                _set_cached_gcp_sources([], gcp_error)
+        else:
+            gcp_error = cached_error
+    
+    # Handle the result: gcp_sources can be None (error), [] (could be success or failure), or [sources...]
+    if gcp_sources is not None:
+        # gcp_sources is a list (could be empty)
+        gcp_count = len(gcp_sources)
+        
+        if gcp_error is not None:
+            # There's an error message, treat as failure
+            gcp_status = "failed"
+            logger.warning(f"GCP fetch completed but with error: {gcp_error}. Found {gcp_count} sources.")
+            # Still add the sources we found (if any)
+            if gcp_count > 0:
+                sources.extend(gcp_sources)
+        elif gcp_count > 0:
+            # Success with sources
+            gcp_status = "success"
+            sources.extend(gcp_sources)
+            logger.info(f"GCP fetch succeeded: {gcp_count} data sources found")
+        else:
+            # Empty list with no error - this means no agents or no data sources in agents
+            gcp_status = "empty"
+            logger.info("GCP fetch succeeded but returned 0 data sources")
+    else:
+        # gcp_sources is None - this means an error occurred
+        if ENABLE_GCP_FETCH:
+            gcp_status = "failed"
+            if gcp_error:
+                logger.warning(f"GCP fetch failed: {gcp_error}")
+            else:
+                gcp_error = "Unknown error - fetch returned None"
+                logger.warning("GCP fetch returned None but no error was captured")
+        else:
+            gcp_status = "disabled"
+            gcp_error = "GCP fetching is disabled via ENABLE_GCP_SOURCES_FETCH"
+            logger.info("GCP sources fetching is disabled, using local file only")
+    
+    # Only use local file sources as fallback if GCP fetch failed or returned empty
+    if gcp_status == "failed" and not sources:
+        # GCP fetch failed completely, fall back to local file
+        logger.info("GCP fetch failed, falling back to ca_profiles.json")
+        local_sources = [{"key": k, "label": v.get("label", k), "source": "local", "agent": v.get("agent"), "table": v.get("table")} for k, v in PROFILES.items()]
+        sources.extend(local_sources)
+    elif gcp_status == "empty":
+        # GCP returned 0 agents, also include local as fallback
+        logger.info("GCP returned 0 agents, including local sources as fallback")
+        local_sources = [{"key": k, "label": v.get("label", k), "source": "local", "agent": v.get("agent"), "table": v.get("table")} for k, v in PROFILES.items()]
+        sources.extend(local_sources)
+    
+    # Deduplicate by agent path (in case same agent exists in both)
+    seen_agents = set()
+    deduped = []
+    for src in sources:
+        agent_path = src.get("agent", "")
+        if agent_path and agent_path in seen_agents:
+            # Skip duplicate, prefer GCP version if available
+            continue
+        if agent_path:
+            seen_agents.add(agent_path)
+        deduped.append(src)
+    
+    # Ensure gcp_error is always a string (not None) when status is failed
+    if gcp_status == "failed" and not gcp_error:
+        gcp_error = "No error message captured - check backend logs for details"
+        logger.warning(f"GCP status is 'failed' but no error was captured. This should not happen.")
+    
+    result = {
+        "sources": deduped,
+        "meta": {
+            "gcp_count": gcp_count,
+            "local_count": len([s for s in deduped if s.get("source") == "local"]),
+            "gcp_status": gcp_status,
+            "gcp_error": gcp_error,
+            "total": len(deduped)
+        }
+    }
+    # Log the response for debugging
+    logger.info(f"Returning sources: status={gcp_status}, error={gcp_error}, gcp_count={gcp_count}, total={len(deduped)}")
+    return result
+    # Log the response for debugging
+    logger.info(f"Returning sources: status={gcp_status}, error={gcp_error}, gcp_count={gcp_count}, local_count={len(local_sources)}")
+    return result
+
+@app.post("/api/chat")
+def chat(body: ChatBody):
+    agent_path = None
+    
+    # Priority 1: Use agent field if provided (GCP agent resource name)
+    if body.agent:
+        if not isinstance(body.agent, str) or not body.agent.strip():
+            raise HTTPException(400, "agent field must be a non-empty string")
+        # Validate agent path format to prevent path traversal
+        agent_path = body.agent.strip()
+        if not re.match(r'^projects/[^/]+/locations/[^/]+/dataAgents/[^/]+$', agent_path):
+            raise HTTPException(400, "Invalid agent path format")
+    # Priority 2: Fall back to profile lookup (backward compatibility)
+    elif body.profile:
+        # Validate profile key to prevent injection
+        if not isinstance(body.profile, str) or not re.match(r'^[a-zA-Z0-9_-]+$', body.profile):
+            raise HTTPException(400, "Invalid profile key format")
+        prof = PROFILES.get(body.profile)
+        if not prof:
+            raise HTTPException(400, "Unknown profile")
+        agent_path = prof.get("agent")
+        if not agent_path:
+            raise HTTPException(400, "No agent configured for this profile")
+    else:
+        # Neither agent nor profile provided
+        raise HTTPException(400, "Provide either agent (GCP agent resource name) or profile (local key).")
+
+    # Validate message input
+    if not isinstance(body.message, str):
+        raise HTTPException(400, "Message must be a string")
+    if len(body.message.strip()) == 0:
+        raise HTTPException(400, "Message cannot be empty")
+    if len(body.message) > 10000:  # Reasonable limit
+        raise HTTPException(400, "Message is too long (max 10000 characters)")
+
+    # Validate history if provided
+    if body.history:
+        if not isinstance(body.history, list):
+            raise HTTPException(400, "History must be an array")
+        if len(body.history) > 100:  # Reasonable limit
+            raise HTTPException(400, "History is too long (max 100 messages)")
+        for item in body.history:
+            if not isinstance(item, dict) or 'role' not in item or 'content' not in item:
+                raise HTTPException(400, "Invalid history item format")
+            if item['role'] not in ['user', 'assistant']:
+                raise HTTPException(400, "Invalid role in history")
+            if not isinstance(item['content'], str) or len(item['content']) > 10000:
+                raise HTTPException(400, "Invalid content in history")
+
+    # Build a contextual prompt from prior turns (client-provided)
+    max_turns = body.maxTurns if body.maxTurns is not None else 6
+    # Validate maxTurns
+    if not isinstance(max_turns, int) or max_turns < 1 or max_turns > 50:
+        max_turns = 6  # Default to safe value
+    prompt = _build_prompt_with_history(body.message, body.history, max_turns=max_turns)
+
+    # Send a single userMessage with the contextualized prompt
+    messages = [{"text": prompt}]
+    t0 = time.perf_counter()
+    result = ca_chat_with_agent_context(agent_path, messages)
+    generation_seconds = round(time.perf_counter() - t0, 1)
+
+    # Build generic, well-structured JSON response
+    answer_text = _best_text(result) or ""
+
+    # Extract charts (from text + entire result) and clean answer
+    charts, cleaned_answer = extract_charts_and_clean(answer_text, result)
+
+    artifacts = {
+        "sql": _find_sql_snippets(result),
+        "tables": _find_table_refs(result),
+        "jobs": _find_jobs(result),
+        "rows": _first_tabular_rows(result),
+        "charts": charts,
+    }
+
+    # Keep SQL out of the main answer. Fall back to bullets from first row if needed.
+    final_answer = cleaned_answer
+    if _looks_like_sql_text(final_answer):
+        from_rows = _bullets_from_first_row(artifacts["rows"])
+        if from_rows:
+            final_answer = from_rows
+        else:
+            final_answer = "I generated a query to answer your question. See the SQL panel below."
+
+    return {
+        "answer": final_answer,   # human-friendly text (no chart code)
+        "artifacts": artifacts,   # sql/tables/jobs/rows + charts (vega-lite specs)
+        "generationTimeSeconds": generation_seconds,  # time to generate response in backend
+        "raw": result             # full stream for debugging
+    }

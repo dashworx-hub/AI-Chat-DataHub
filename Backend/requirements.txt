@@ -1,0 +1,14 @@
+# CA API Backend - Python dependencies
+# Install with: pip install -r backend/requirements.txt
+
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+requests>=2.31.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+google-auth>=2.22.0
+google-auth-oauthlib>=1.0.0
+
+# TestClient (Starlette) needs httpx; pytest for running tests
+httpx>=0.25.0
+pytest>=7.0.0

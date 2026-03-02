@@ -1,0 +1,100 @@
+STARTUP GUIDE (LOCAL)
+====================
+
+This project runs as TWO local processes:
+
+  - Backend: FastAPI app in "Backend/"   (port 8080)
+  - Frontend: React + Vite in "Frontend/" (port 3000)
+    The frontend proxies "/api" -> http://localhost:8080
+
+
+PREREQUISITES
+-------------
+
+  - Python 3.10+  (python3)
+  - Node.js 18+   (includes npm)
+
+
+ONE-TIME SETUP
+--------------
+
+1) Backend dependencies
+
+  From the project root:
+
+    python3 -m pip install -r Backend/requirements.txt
+
+2) Frontend dependencies
+
+  From the project root:
+
+    cd Frontend
+    npm install
+
+
+ENVIRONMENT / GCP AUTH (ALREADY MAPPED)
+--------------------------------------
+
+This repo already contains a root ".env" and the backend loads it.
+
+Key values in ".env":
+
+  - CA_BILLING_PROJECT=...
+  - GOOGLE_APPLICATION_CREDENTIALS=CA_API.json
+  - CA_LOCATION=global
+
+As long as "CA_API.json" exists in the PROJECT ROOT (same level as ".env"),
+you do not need any additional GCP authentication steps to run locally.
+
+
+START THE APP
+-------------
+
+BACKEND (port 8080)
+
+Method 1 (recommended): 
+
+Step-1: Use the startup script (from the project root)
+
+    ./start-backend.sh
+
+step-2: Use the startup script (in a second terminal, from the project root)
+
+    ./start-frontend.sh
+
+Method 2 (manual): 
+
+Step-1: Run the backend directly
+
+    cd Backend
+    python3 -m uvicorn main:app --reload --port 8080
+
+step-2: Run the frontend directly
+
+    cd Frontend
+    npm run dev
+    
+
+Open the UI:
+
+  http://localhost:3000
+
+
+TROUBLESHOOTING
+---------------
+
+1) "uvicorn not found"
+
+    python3 -m pip install -r Backend/requirements.txt
+    python3 -m uvicorn main:app --reload --port 8080
+
+2) Backend complains about missing credentials / "CA_API.json"
+
+  - Ensure "CA_API.json" is in the project root
+  - Ensure ".env" contains: GOOGLE_APPLICATION_CREDENTIALS=CA_API.json
+
+3) Frontend can’t reach backend
+
+  - Confirm backend is running: http://localhost:8080/healthz
+  - Frontend proxies "/api" -> http://localhost:8080 (see "Frontend/vite.config.js")
+

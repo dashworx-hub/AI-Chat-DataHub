@@ -1,0 +1,200 @@
+
+CURRENT STATE OF THE APPLICATION - FULL EXPLANATION
+
+This file describes what the application is, how it works, and what each part
+does. Written in plain language so anyone can understand it.
+
+
+1. WHAT IS THIS APPLICATION?
+
+
+  - It is a web app where you talk to AI "data agents" in plain language.
+  - Each agent is connected to the BigQuery data (tables in Google Cloud).
+  - You ask questions (e.g. "What was total revenue last month?"), and the
+    agent runs SQL on your data and answers with text, tables, and sometimes
+    charts.
+  - You can also create, edit, and delete these agents from the
+    same app.
+
+So: one place to manage AI agents that analyze your BigQuery data and to chat
+with them.
+
+
+2. HOW IS THE APP BUILT? (ARCHITECTURE)
+
+
+The app has two main parts that run separately:
+
+  (A) FRONTEND (what you see in the browser)
+      - Built with: React, Vite, Tailwind CSS.
+      - Runs on: port 3000 (when you use the start script).
+      - Folder: frontend/
+      - It shows the pages, buttons, forms, and chat. When you click
+        something, it sends requests to the backend.
+
+  (B) BACKEND (the server that talks to Google Cloud)
+      - Built with: Python, FastAPI, Uvicorn.
+      - Runs on: port 8080.
+      - Folder: backend/
+      - It receives requests from the frontend, calls Google Cloud APIs
+        (BigQuery, Gemini Data Analytics), and returns data back to the
+        frontend.
+
+  (C) GOOGLE CLOUD
+      - BigQuery: Where your data lives (projects, datasets, tables).
+        The app lists them and the agents query them.
+      - Gemini Data Analytics (Data Analytics Agent): The service that
+        powers the agents (create, update, delete, and chat).
+
+So: Browser (frontend) --> Backend (Python API) --> Google Cloud (BigQuery +
+Gemini). The backend uses a service account (a key file) to authenticate
+with Google Cloud.
+
+
+3. THE FOUR MAIN PAGES
+
+
+  (1) CHAT (home page, path: /)
+      - You see a list of data sources. Each source is an agent (from
+        Google Cloud or from a local config file).
+      - You select one agent, type a message, and send. The agent runs
+        queries on its BigQuery data and replies with text, tables, and
+        charts.
+      - You see "Thought for N s" (how long the answer took) and can expand
+        artifacts (SQL, tables, charts) in a side panel.
+      - Numbers in answers can be formatted by currency (e.g. yen, dollars)
+        depending on agent settings.
+
+  (2) AGENT MANAGER (path: /agents)
+      - Lists all agents (from Google Cloud and/or local ca_profiles.json).
+      - You can view an agent's details, edit its system instruction
+        or display label, and delete it.
+      - Custom labels are stored in agent_labels.json so you can give
+        friendly names to agents.
+
+  (3) CREATE AGENT (path: /create)
+      - A form to create a new Data Analytics Agent in Google Cloud.
+      - You enter: Agent ID (slug), Display label, System instruction,
+        currency for answers, and data source (BigQuery project, dataset,
+        and optionally table).
+      - You can type a GCP project ID manually, or use Organization ID
+        to load all projects under an org and pick one from a dropdown.
+      - When you click Create, the backend creates the agent in Google Cloud.
+        Your instruction is automatically combined with guard rails and
+        SQL instructions (see section 5).
+
+  (4) SETTINGS (path: /settings)
+      - Set the API base URL (where the frontend sends API calls; e.g.
+        http://localhost:8080 for local backend).
+      - Optional query limits and data source / profile settings.
+
+
+4. WHERE DOES THE LIST OF AGENTS COME FROM?
+
+
+  - Primary: The backend fetches agents from Google Cloud (Gemini Data
+    Analytics API). These show up as "GCP" in the UI (with a Google Cloud icon).
+  - Fallback / extra: A file ca_profiles.json (in backend/) can define
+    extra "profiles" that point to existing agents. So you can mix GCP agents
+    and local profile definitions.
+  - The backend caches the list from GCP for a few minutes so the app
+    stays fast. The cache is cleared when you create or delete an agent.
+
+
+5. AUTOMATIC RULES (GUARD RAILS + SQL INSTRUCTIONS)
+
+
+When you create or edit an agent's instruction, the backend always appends
+two blocks of text that the user cannot edit:
+
+  (A) GUARD RAILS
+      - Rules such as: stay on topic, don't make up data, don't include raw
+        SQL in the final answer unless the system allows it, use proper
+        table/chart formatting, etc.
+      - They keep the agent safe and consistent.
+
+  (B) SQL INSTRUCTIONS
+      - Rules for how the agent should write SQL: one query per request,
+        uppercase keywords, full table paths (project.dataset.table), use
+        SAFE_DIVIDE, proper date filters, no SELECT , etc.
+      - They improve correctness and performance of the generated queries.
+
+So: your instruction + guard rails + SQL instructions = the full system
+instruction sent to Google for that agent. You only type the first part; the
+rest is added automatically.
+
+
+6. MAIN THINGS THE BACKEND DOES (API ENDPOINTS IN SIMPLE TERMS)
+
+
+  - GET  /api/agents              -> List all agents (GCP + local).
+  - GET  /api/agents/{id}         -> Get one agent's details.
+  - PATCH /api/agents/{id}/instruction -> Update an agent's instruction.
+  - PATCH /api/agents/{id}/label  -> Update an agent's display label.
+  - DELETE /api/agents/{id}       -> Delete an agent from GCP.
+  - POST /api/agents              -> Create a new agent in GCP.
+
+  - GET  /api/bq/projects                    -> List BigQuery projects.
+  - GET  /api/bq/organizations/{org_id}/projects -> List projects in an org.
+  - GET  /api/bq/datasets?project=...        -> List datasets in a project.
+  - GET  /api/bq/tables?project=...&dataset=... -> List tables in a dataset.
+  - GET  /api/bq/table-schema?project=...&dataset=...&table=... -> Table schema.
+
+  - GET  /api/sources   -> List data sources (agents as sources for chat).
+  - POST /api/chat      -> Send a message to an agent and get a reply.
+
+  - GET  /healthz       -> Health check (e.g. for monitoring).
+
+
+7. CONFIGURATION AND HOW TO RUN
+
+
+  (A) ENVIRONMENT (.env in repo root or in backend/)
+      - CA_BILLING_PROJECT          -> Your Google Cloud project ID (for
+                                       billing and API calls).
+      - GOOGLE_APPLICATION_CREDENTIALS -> Path to service account JSON key.
+      - CA_LOCATION                 -> e.g. "global" (default).
+      - Optional: ENABLE_GCP_SOURCES_FETCH, GCP_SOURCES_CACHE_TTL, etc.
+
+  (B) STARTING THE APP
+      - Backend:  ./start-backend.sh   (or: cd backend && python3 -m uvicorn main:app --reload --port 8080)
+      - Frontend: ./start-frontend.sh  (or: cd frontend && npm run dev)
+      - Then open: http://localhost:3000   (frontend proxies /api to 8080).
+
+  (C) FIRST-TIME SETUP
+      - pip install -r backend/requirements.txt
+      - Put .env in place with CA_BILLING_PROJECT and GOOGLE_APPLICATION_CREDENTIALS.
+      - Ensure backend/ca_profiles.json exists (can be empty or with profiles).
+
+
+8. IMPORTANT FILES AND FOLDERS
+
+
+  - frontend/           -> All UI code (React, pages, components, styles).
+  - backend/            -> All API code (main.py, config, agent labels).
+  - backend/main.py     -> Single FastAPI app; all routes and GCP calls.
+  - backend/ca_profiles.json   -> Optional local agent profiles.
+  - backend/agent_labels.json -> Custom display labels for agents.
+  - backend/requirements.txt  -> Python dependencies.
+  - .env                -> Environment variables (root or backend/).
+  - start-backend.sh    -> Starts backend from backend/ on port 8080.
+  - start-frontend.sh   -> Starts frontend from frontend/ on port 3000.
+
+
+9. SUMMARY IN ONE PARAGRAPH
+
+
+The application is a web-based chat and agent management tool. The frontend
+(React) runs in the browser; the backend (FastAPI) runs on your machine and
+talks to Google Cloud. Users choose a data agent (linked to BigQuery), ask
+questions in plain language, and get answers with text, tables, and charts.
+Users can also create new agents (with project/dataset/table and instructions),
+edit or delete agents, and list projects either by project ID or by
+organization ID. Every agent's instruction is automatically extended with
+guard rails and SQL rules. The app uses a single service account for BigQuery
+and Gemini Data Analytics; all assigned roles are used as described in
+SA_ROLES_EXPLAINED.txt.
+
+
+End of file.
+
