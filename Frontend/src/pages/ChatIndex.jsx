@@ -1008,10 +1008,10 @@ const ChatIndex = () => {
                   <p className="section-title mb-4">Suggested Questions</p>
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
                     {[
-                      "Give me sales vs budget insights over the last 7 days?",
+                      "Give me sales vs budget insights over the last 7 days.",
                       "Which is the best performing last click attribution channel over the last 30 days?",
-                      "Show me the best performing product collections over the last 7 days?",
-                      "Show me sales vs cost insights over the last 7 days?"
+                      "Show me the best performing product collections over the last 7 days.",
+                      "Show me sales vs cost insights over the last 7 days."
                     ].map((question, idx) => (
                       <button
                         key={idx}
