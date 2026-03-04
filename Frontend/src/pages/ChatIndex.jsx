@@ -862,7 +862,7 @@ const ChatIndex = () => {
   const handleKeyDown = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      handleSend();
+      if (!isTyping) handleSend();
     }
   };
 
@@ -1210,7 +1210,7 @@ const ChatIndex = () => {
                 />
                 <button
                   onClick={handleSend}
-                  disabled={!message.trim() || !selectedProfile}
+                  disabled={!message.trim() || !selectedProfile || isTyping}
                   className="absolute right-2 bottom-2 w-8 h-8 rounded-xl bg-[#3E0AC2] text-white flex items-center justify-center hover:bg-[#2B0799] transition-all duration-200 disabled:opacity-30 disabled:cursor-not-allowed"
                   title="Send message (Enter)"
                 >

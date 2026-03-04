@@ -1570,6 +1570,7 @@ def _iter_streaming_messages(
                 decoded = line.decode("utf-8")
             except UnicodeDecodeError:
                 continue
+            print("RAW LINE REPR:", repr(decoded)) # DEBUG
             # NDJSON: each line is a complete JSON object
             stripped = decoded.strip()
             if stripped.startswith("{") and not acc:
@@ -1577,6 +1578,7 @@ def _iter_streaming_messages(
                     obj = json.loads(stripped)
                     if isinstance(obj, dict):
                         accumulated.append(obj)
+                        print("Yield At:", time.time()) # timestamp of yield
                         yield (obj, accumulated)
                 except json.JSONDecodeError:
                     acc = stripped
@@ -1593,6 +1595,7 @@ def _iter_streaming_messages(
                         obj = json.loads(acc)
                         if isinstance(obj, dict):
                             accumulated.append(obj)
+                            print("Yield At:", time.time()) # timestamp of yield
                             yield (obj, accumulated)
                     except json.JSONDecodeError:
                         pass
@@ -1605,6 +1608,7 @@ def _iter_streaming_messages(
                     obj = json.loads(acc)
                     if isinstance(obj, dict):
                         accumulated.append(obj)
+                        print("Yield At:", time.time()) # timestamp of yield
                         yield (obj, accumulated)
                         acc = ""
                     elif isinstance(obj, list):
@@ -1612,6 +1616,7 @@ def _iter_streaming_messages(
                         for item in obj:
                             if isinstance(item, dict):
                                 accumulated.append(item)
+                                print("Yield At:", time.time()) # timestamp of yield
                                 yield (item, accumulated)
                         acc = ""
                 except json.JSONDecodeError:

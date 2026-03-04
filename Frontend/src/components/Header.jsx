@@ -1,7 +1,7 @@
 import { Link, useLocation } from 'react-router-dom';
 import { Settings, UserPlus, Server, AlertCircle, PanelLeft, PanelLeftClose, Menu, X, MessageSquare, Bot } from 'lucide-react';
 import { useState, useEffect, useRef } from 'react';
-import { getApiBase, setApiBase } from '../utils/api';
+import { getApiBase, setApiBase, clearApiBaseOverride } from '../utils/api';
 
 const Header = ({ title, onToggleSidebar, sidebarOpen }) => {
   const location = useLocation();
@@ -179,6 +179,17 @@ const Header = ({ title, onToggleSidebar, sidebarOpen }) => {
                       placeholder="http://localhost:8080"
                     />
                   </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      clearApiBaseOverride();
+                      setApiBaseState(getApiBase());
+                      setApiBase(getApiBase());
+                    }}
+                    className="mt-2 text-xs text-gray-500 hover:text-[#3E0AC2]"
+                  >
+                    Reset to default
+                  </button>
                 </div>
               )}
             </div>
@@ -262,6 +273,17 @@ const Header = ({ title, onToggleSidebar, sidebarOpen }) => {
                 placeholder="http://localhost:8080"
               />
             </div>
+            <button
+              type="button"
+              onClick={() => {
+                clearApiBaseOverride();
+                setApiBaseState(getApiBase());
+                setApiBase(getApiBase());
+              }}
+              className="mt-2 mx-3 text-xs text-gray-500 hover:text-[#3E0AC2]"
+            >
+              Reset to default
+            </button>
           </div>
         </div>
       )}

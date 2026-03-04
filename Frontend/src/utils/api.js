@@ -1,15 +1,29 @@
 // API utility functions - preserving exact API connections
 
+/** Normalize URL: add https:// if missing scheme */
+const normalizeBase = (url) => {
+  if (!url || typeof url !== 'string') return url;
+  const trimmed = url.trim();
+  if (!trimmed) return trimmed;
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) return trimmed;
+  return `https://${trimmed}`;
+};
+
 export const getApiBase = () => {
-  return (
+  const raw =
     localStorage.getItem('apiBase') ||
     import.meta.env.VITE_API_BASE_URL ||
-    'http://localhost:8080'
-  );
+    'http://localhost:8080';
+  return normalizeBase(raw);
 };
 
 export const setApiBase = (base) => {
   localStorage.setItem('apiBase', base);
+};
+
+/** Clear stored override; next getApiBase() will use env var or localhost */
+export const clearApiBaseOverride = () => {
+  localStorage.removeItem('apiBase');
 };
 
 export const apiRequest = async (endpoint, options = {}) => {
