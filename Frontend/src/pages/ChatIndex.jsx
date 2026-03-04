@@ -10,19 +10,19 @@ import vegaEmbed from 'vega-embed';
 import { formatNumbersInText, getCurrencyForContext, stripMarkdownEmphasis } from '../utils/currency';
 
 const TYPING_STATUS_PHRASES = [
-  'Brewing',
-  'Whispering to the data',
-  'Thinking it through',
-  'Turning it over',
-  'Letting it simmer',
-  'Looking closer...',
-  'Connecting the dots...',
-  'Reading between the lines...',
-  'Untangling...',
-  'Drawing the threads together...',
-  'Weighing it up...',
-  'Piecing it together...',
-  'Waiting for it to click...',
+  'Processing query...',
+  'Retrieving real-time data...',
+  'calculating variances...',
+  'Aggregating data Streams...',
+  'Mapping relationships...',
+  'Auditing data quality...',
+  'Finalising report...',
+  'Identifying key trends...',
+  'De-duplicating records...',
+  'Synthesising insights...',
+  'Evaluating significance...',
+  'Validating logic...',
+  'Structuring response...',
 ];
 
 const ChartGallery = ({ charts, messageIdx, onRenderChart }) => {
@@ -795,6 +795,25 @@ const ChatIndex = () => {
                 }
               }
             },
+            onAnswerDelta: (ev) => {
+              usedStream = true;
+              const delta =
+                typeof ev === 'string'
+                  ? ev
+                  : (typeof ev?.delta === 'string' ? ev.delta : null);
+              if (!delta) return;
+              const idx = streamingAssistantIdxRef.current;
+              if (idx == null) return;
+              setHistory((prev) => {
+                const next = [...prev];
+                if (idx >= 0 && idx < next.length) {
+                  const existing = next[idx] || {};
+                  const prevContent = typeof existing.content === 'string' ? existing.content : '';
+                  next[idx] = { ...existing, role: 'assistant', content: prevContent + delta };
+                }
+                return next;
+              });
+            },
             onDone: (data) => {
               usedStream = true;
               processFinalResponse(data, true);
@@ -890,8 +909,21 @@ const ChatIndex = () => {
             {/* Data Sources */}
             <div>
               <div className="flex items-center justify-between mb-3">
-                <h2 className="section-title">Data Sources</h2>
-                <div className="flex items-center gap-1.5">
+                <div className="flex items-center gap-2 flex-wrap min-w-0">
+                  <h2 className="section-title">Data Sources</h2>
+                  {sourcesMeta.gcp_count > 0 && (
+                    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-blue-50 text-blue-700 border border-blue-200 flex-shrink-0">
+                      <img src="/g_cloud/icons8-google-cloud-48.svg" alt="" className="w-3 h-3" />
+                      {sourcesMeta.gcp_count}
+                    </span>
+                  )}
+                  {sourcesMeta.local_count > 0 && (
+                    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-gray-50 text-gray-500 border border-gray-200 flex-shrink-0">
+                      {sourcesMeta.local_count} Local
+                    </span>
+                  )}
+                </div>
+                <div className="flex items-center gap-1.5 flex-shrink-0">
                   {sourcesMeta.gcp_status === 'failed' && (
                     <button
                       onClick={() => showToast(`GCP Error: ${sourcesMeta.gcp_error || 'Unknown error'}`, 'error')}
@@ -918,21 +950,6 @@ const ChatIndex = () => {
                   </button>
                 </div>
               </div>
-              {sources.length > 0 && (
-                <div className="flex items-center gap-1.5 mb-2">
-                  {sourcesMeta.gcp_count > 0 && (
-                    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-blue-50 text-blue-700 border border-blue-200">
-                      <img src="/g_cloud/icons8-google-cloud-48.svg" alt="" className="w-3 h-3" />
-                      {sourcesMeta.gcp_count}
-                    </span>
-                  )}
-                  {sourcesMeta.local_count > 0 && (
-                    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-gray-50 text-gray-500 border border-gray-200">
-                      {sourcesMeta.local_count} Local
-                    </span>
-                  )}
-                </div>
-              )}
               <div className="space-y-1">
                 {sources.map((source) => (
                   <label
@@ -955,60 +972,12 @@ const ChatIndex = () => {
                           <span className="text-[9px] font-medium text-gray-400 uppercase flex-shrink-0">Local</span>
                         )}
                       </div>
-                      <div className="text-[11px] text-gray-400 truncate">{source.key}</div>
                     </div>
                   </label>
                 ))}
               </div>
             </div>
 
-            {/* Divider */}
-            <div className="border-t border-gray-100"></div>
-
-            {/* Artifacts / SQL */}
-            <div className="flex-1 min-h-0 flex flex-col">
-              <h2 className="section-title mb-2">Artifacts</h2>
-              <details open className={`border rounded-lg flex-1 flex flex-col overflow-hidden ${sqlError ? 'border-red-300 bg-red-50' : 'border-gray-200'}`}>
-                <summary className="px-3 py-2.5 font-medium text-sm text-gray-800 cursor-pointer hover:bg-gray-50 transition-colors flex items-center gap-2">
-                  <Database className="w-3.5 h-3.5" />
-                  SQL
-                  {sqlError && <span className="badge badge-error text-[10px] ml-1">Error</span>}
-                  <ChevronDown className="w-3.5 h-3.5 ml-auto" />
-                </summary>
-                <div className={`px-3 py-3 border-t overflow-y-auto overflow-x-auto scrollbar-thin flex-1 ${sqlError ? 'border-red-200 bg-red-50' : 'border-gray-100 bg-gray-900'}`}>
-                  {sqlError && (
-                    <div className="mb-3 p-2.5 bg-red-100 border border-red-300 rounded text-xs text-red-800">
-                      <div className="font-semibold mb-1">SQL Validation Error:</div>
-                      <div className="whitespace-pre-wrap break-words mb-2">{sqlError}</div>
-                      {sqlError.match(/\[(\d+):(\d+)\]/) && (
-                        <div className="text-xs text-red-700 mt-2 pt-2 border-t border-red-300">
-                          <div className="font-medium">Line {sqlError.match(/\[(\d+):(\d+)\]/)[1]}, Col {sqlError.match(/\[(\d+):(\d+)\]/)[2]}</div>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                  {artifacts.sql && artifacts.sql !== 'No SQL.' ? (
-                    <pre className={`text-xs font-mono whitespace-pre-wrap break-words leading-relaxed ${sqlError ? 'text-gray-600' : 'text-gray-300'}`}>
-                      {artifacts.sql.split('\n').map((line, idx) => {
-                        const errorMatch = sqlError?.match(/\[(\d+):(\d+)\]/);
-                        const errorLine = errorMatch ? parseInt(errorMatch[1]) - 1 : -1;
-                        const isErrorLine = errorLine >= 0 && idx === errorLine;
-                        return (
-                          <div key={idx} className={isErrorLine ? 'bg-red-200 text-red-900 px-1 rounded' : ''}>
-                            <span className={`mr-3 select-none ${sqlError ? 'text-gray-400' : 'text-gray-600'}`}>{idx + 1}</span>
-                            {line}
-                          </div>
-                        );
-                      })}
-                    </pre>
-                  ) : (
-                    <pre className={`text-xs font-mono ${sqlError ? 'text-gray-500' : 'text-gray-500'}`}>
-                      {artifacts.sql}
-                    </pre>
-                  )}
-                </div>
-              </details>
-            </div>
           </div>
         </aside>
 
@@ -1035,14 +1004,14 @@ const ChatIndex = () => {
                 <h2 className="text-xl font-bold text-gray-900 mb-2 font-display">Ask your data anything</h2>
                 <p className="text-sm text-gray-500 max-w-md mx-auto mb-10">Select a data source and ask a question to get started with your analysis.</p>
                 
-                <div className="max-w-2xl mx-auto w-full">
+                <div className="max-w-5xl mx-auto w-full"> 
                   <p className="section-title mb-4">Suggested Questions</p>
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
                     {[
-                      "Give me an overview of the data",
-                      "What are the key trends in this dataset?",
-                      "Show me summary statistics",
-                      "What are the top categories by count?"
+                      "Give me sales vs budget insights over the last 7 days?",
+                      "Which is the best performing last click attribution channel over the last 30 days?",
+                      "Show me the best performing product collections over the last 7 days?",
+                      "Show me sales vs cost insights over the last 7 days?"
                     ].map((question, idx) => (
                       <button
                         key={idx}
@@ -1054,16 +1023,6 @@ const ChatIndex = () => {
                         {question}
                       </button>
                     ))}
-                  </div>
-                  <div className="flex justify-center mt-2.5">
-                    <button
-                      onClick={() => sendMessage("Identify any patterns or correlations")}
-                      disabled={!selectedProfile}
-                      className="text-left px-4 py-3 bg-white border border-gray-200 rounded-xl hover:border-[#3E0AC2]/40 hover:shadow-md hover:-translate-y-0.5 transition-all duration-200 text-sm text-gray-700 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:border-gray-200 disabled:hover:bg-white disabled:hover:shadow-none disabled:hover:translate-y-0 w-full md:w-auto md:max-w-[calc(50%-0.375rem)] scale-in"
-                      style={{ animationDelay: '0.24s' }}
-                    >
-                      Identify any patterns or correlations
-                    </button>
                   </div>
                 </div>
               </div>

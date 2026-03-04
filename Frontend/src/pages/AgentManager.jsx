@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Search, RefreshCw, Plus, Eye, Edit, Trash2, Copy, Save, X, FileText, Bot, ChevronRight, Clock, ShieldCheck, Code } from 'lucide-react';
+import { Search, RefreshCw, Plus, Eye, Edit, Trash2, Save, X, FileText, Bot, ChevronRight, Clock, ShieldCheck, Code } from 'lucide-react';
 import Spinner from '../components/Spinner';
 import { Link } from 'react-router-dom';
 import Header from '../components/Header';
@@ -304,16 +304,6 @@ const AgentManager = () => {
     setDeleteModal({ show: false, agent: null, profileKey: null });
   };
 
-  const handleCopyPath = async () => {
-    if (!selected) return;
-    try {
-      await navigator.clipboard.writeText(selected.path || '');
-      showToast('Agent path copied to clipboard', 'success');
-    } catch (e) {
-      showToast('Copy failed', 'error');
-    }
-  };
-
   return (
     <div className="h-screen bg-gray-50 flex flex-col overflow-hidden page-enter">
       <Header title="Agent Manager" />
@@ -327,10 +317,6 @@ const AgentManager = () => {
                   <div>
                     <h2 className="section-title mb-1">Agents</h2>
                     <div className="flex items-center gap-2 flex-wrap">
-                      <p className="text-sm text-gray-600">
-                        From <span className="text-mono font-semibold text-blue-600">ca_profiles.json</span>
-                        {gcpCount > 0 && <span> and <span className="text-mono font-semibold text-blue-600">GCP</span></span>}
-                      </p>
                       {gcpStatus.status === 'failed' && (
                         <button
                           onClick={() => {
@@ -472,22 +458,6 @@ const AgentManager = () => {
                               >
                                 <Edit className="w-4 h-4" />
                               </button>
-                              <button
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  handleRemoveProfile(key, agent);
-                                }}
-                                className={`p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded transition-colors ${
-                                  agent.source === 'gcp' ? '' : ''
-                                }`}
-                                title={
-                                  agent.source === 'gcp'
-                                    ? 'Delete from Google Cloud Platform'
-                                    : 'Remove from ca_profiles.json'
-                                }
-                              >
-                                <Trash2 className="w-4 h-4" />
-                              </button>
                             </div>
                           </div>
                           {isSelected && (
@@ -539,59 +509,7 @@ const AgentManager = () => {
                   </div>
                 ) : (
                   <div className="space-y-6">
-                    <div>
-                      <label className="text-label mb-2 block">Agent Path</label>
-                      <div className="flex items-center gap-2">
-                        <div className="flex-1 text-mono text-sm bg-gray-50 px-3 py-2 rounded border border-gray-200 text-gray-700 truncate">
-                          {selected.path}
-                        </div>
-                        <button
-                          onClick={handleCopyPath}
-                          className="btn-secondary"
-                        >
-                          <Copy className="w-4 h-4" />
-                        </button>
-                      </div>
-                    </div>
-
-                    <div>
-                      <label className="text-label mb-2 block">Currency for responses</label>
-                      <p className="text-hint mb-2">
-                        Numbers in this agent&apos;s chat responses will be formatted with this currency.
-                      </p>
-                      <select
-                        value={agentCurrency.code}
-                        onChange={(e) => {
-                          const c = CURRENCIES.find((x) => x.code === e.target.value);
-                          if (c && selected) {
-                            setCurrencyForAgent(selected.id, c);
-                            setAgentCurrency(c);
-                            showToast(`Currency set to ${c.name}`, 'success');
-                            window.dispatchEvent(new Event('currencyChanged'));
-                          }
-                        }}
-                        className="input-field w-full max-w-xs"
-                      >
-                        {CURRENCIES.map((c) => (
-                          <option key={c.code} value={c.code}>
-                            {c.symbol} - {c.name} ({c.code})
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-
-                    <details className="border border-gray-200 rounded-lg">
-                      <summary className="px-4 py-3 font-semibold text-sm text-gray-900 cursor-pointer hover:bg-gray-50 transition-colors">
-                        Raw Describe Response
-                      </summary>
-                      <div className="px-4 py-3 border-t border-gray-200 bg-gray-50">
-                        <pre className="text-mono text-xs text-gray-600 whitespace-pre-wrap overflow-x-auto">
-                          {JSON.stringify(currentDescribe, null, 2)}
-                        </pre>
-                      </div>
-                    </details>
-
-                    <div className="border-t border-gray-200 pt-6">
+                    <div className="border-b border-gray-200 pb-6">
                       <div className="flex items-center justify-between mb-4">
                         <div>
                           <label className="text-label mb-1 block">System Instruction</label>
@@ -599,8 +517,8 @@ const AgentManager = () => {
                             Edit your instructions only. Guard rails and SQL instructions are appended automatically and cannot be edited.
                           </p>
                           {lastUpdated && (
-                            <div className="flex items-center gap-1.5 mt-1.5 text-xs text-gray-500">
-                              <Clock className="w-3 h-3" />
+                            <div className="flex items-center gap-1.5 mt-1.5 text-xs text-gray-400 italic">
+                              <Clock className="w-3 h-3 flex-shrink-0" />
                               <span>Last updated: {lastUpdated.toLocaleString()}</span>
                             </div>
                           )}
@@ -635,22 +553,71 @@ const AgentManager = () => {
                           </pre>
                         </div>
                       </details>
-                      <div className="flex items-center gap-3 mt-4">
-                        <button
-                          onClick={handleSave}
-                          className="btn-primary"
-                        >
-                          <Save className="w-4 h-4" />
-                          Save Instruction
-                        </button>
-                        <button
-                          onClick={handleDiscard}
-                          className="btn-secondary"
-                        >
-                          <X className="w-4 h-4" />
-                          Discard Changes
-                        </button>
-                      </div>
+                    </div>
+
+                    <div>
+                      <label className="text-label mb-2 block">Currency for responses</label>
+                      <p className="text-hint mb-2">
+                        Numbers in this agent&apos;s chat responses will be formatted with this currency.
+                      </p>
+                      <select
+                        value={agentCurrency.code}
+                        onChange={(e) => {
+                          const c = CURRENCIES.find((x) => x.code === e.target.value);
+                          if (c && selected) {
+                            setCurrencyForAgent(selected.id, c);
+                            setAgentCurrency(c);
+                            showToast(`Currency set to ${c.name}`, 'success');
+                            window.dispatchEvent(new Event('currencyChanged'));
+                          }
+                        }}
+                        className="input-field w-full max-w-xs"
+                      >
+                        {CURRENCIES.map((c) => (
+                          <option key={c.code} value={c.code}>
+                            {c.symbol} - {c.name} ({c.code})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="flex items-center gap-3 pt-4">
+                      <button
+                        onClick={handleSave}
+                        className="btn-primary"
+                      >
+                        <Save className="w-4 h-4" />
+                        Save Instruction
+                      </button>
+                      <button
+                        onClick={handleDiscard}
+                        className="btn-secondary"
+                      >
+                        <X className="w-4 h-4" />
+                        Discard Changes
+                      </button>
+                    </div>
+
+                    <div className="mt-6 pt-6 border-t border-red-200 rounded-lg bg-red-50/50 border px-4 py-4">
+                      <h3 className="text-sm font-semibold text-red-800 mb-2">Danger zone</h3>
+                      <p className="text-xs text-red-700/90 mb-3">
+                        Deleting this agent cannot be undone.
+                        {filtered.find((a) => a.agent.split('/').pop() === selected?.id)?.source === 'gcp'
+                          ? ' For GCP agents, the agent will be removed from Google Cloud Platform.'
+                          : ' For local agents, it will be removed from ca_profiles.json.'}
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const agent = filtered.find((a) => a.agent.split('/').pop() === selected?.id);
+                          const key = agent?.key || agent?.agent?.split('/').pop() || selected?.id;
+                          if (agent) handleRemoveProfile(key, agent);
+                        }}
+                        className="inline-flex items-center gap-2 px-3 py-2 text-sm font-medium text-red-700 bg-white border border-red-200 rounded-lg hover:bg-red-50 transition-colors"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                        Delete agent
+                      </button>
                     </div>
                   </div>
                 )}

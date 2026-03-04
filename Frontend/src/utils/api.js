@@ -174,6 +174,7 @@ export const sendChatMessage = async (profile, message, history, maxTurns = 6, a
  * Streaming chat: calls /api/chat/stream, parses SSE events, and invokes callbacks.
  * @param {Object} params - Same as sendChatMessage
  * @param {Function} onCotStep - Called with { chainOfThought } when a new CoT step arrives
+ * @param {Function} onAnswerDelta - Called with { delta } when new answer text arrives
  * @param {Function} onDone - Called with full response (answer, artifacts, chainOfThought, etc.) when complete
  * @param {Function} onError - Called with error message on failure
  */
@@ -183,7 +184,7 @@ export const sendChatMessageStream = async (
   history,
   maxTurns = 6,
   agentPath = null,
-  { onCotStep, onDone, onError }
+  { onCotStep, onAnswerDelta, onDone, onError }
 ) => {
   const base = getApiBase();
   const url = `${base}/api/chat/stream`;
@@ -231,6 +232,8 @@ export const sendChatMessageStream = async (
             const data = JSON.parse(line.slice(5).trim());
             if (currentEvent === 'cot_step') {
               onCotStep?.(data);
+            } else if (currentEvent === 'answer_delta') {
+              onAnswerDelta?.(data);
             } else if (currentEvent === 'done') {
               onDone?.(data);
             } else if (currentEvent === 'error') {

@@ -2759,6 +2759,19 @@ def _generate_chat_stream(body: ChatBody):
                         cot_parts.append(part)
                         yield sse("cot_step", {"step": cot_step_num, "label": label, "content": part, "chainOfThought": "\n\n".join(cot_parts)})
                         cot_step_num += 1
+                # Stream answer text deltas as FINAL_RESPONSE messages arrive
+                try:
+                    # Get the full current text from the accumulated message
+                    full_current_text = _best_text(accumulated) or ""
+                    
+                    if len(full_current_text) > last_sent_len:
+                        # Only yield the NEW part
+                        new_content = full_current_text[last_sent_len:]
+                        yield sse("answer_delta", {"delta": new_content})
+                        # Update the tracker
+                        last_sent_len = len(full_current_text)
+                except Exception:
+                    logger.debug("Delta extraction failed")
         except HTTPException:
             raise
         except Exception as e:
@@ -2819,5 +2832,6 @@ def chat_stream(body: ChatBody):
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
+            "Content-Encoding": "identity",
         },
     )
