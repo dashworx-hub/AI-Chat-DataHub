@@ -111,7 +111,14 @@ const ChatIndex = () => {
   const [loadingSources, setLoadingSources] = useState(false);
   const [toast, setToast] = useState({ show: false, message: '', type: 'info' });
   const [sidebarOpen, setSidebarOpen] = useState(() => {
-    try { return localStorage.getItem('sidebarOpen') !== 'false'; } catch { return true; }
+    try {
+      const stored = localStorage.getItem('sidebarOpen');
+      if (stored === 'true') return true;
+      if (stored === 'false') return false;
+      return false; // default: closed
+    } catch {
+      return false;
+    }
   });
   const chatEndRef = useRef(null);
   const chatScrollRef = useRef(null);
